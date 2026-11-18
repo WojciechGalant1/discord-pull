@@ -15,6 +15,7 @@ MAX_HISTORY = 3000
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
+ROLE_ID = "1572719490435653813"  # Rola oznaczana w każdym poście; pusty tekst wyłącza oznaczanie
 
 WEBHOOK_PATTERN = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
@@ -382,18 +383,32 @@ def resolve_redgifs_mp4(gif_id: str, urls: dict | None = None) -> bytes | None:
     return None
 
 
+def message_header(title: str) -> str:
+    parts = []
+    if ROLE_ID:
+        parts.append(f"<@&{ROLE_ID}>")
+    if title:
+        parts.append(f"**{title}**")
+    return " ".join(parts)
+
+
 def post_to_discord(webhook_url: str, content: str, file_tuple: tuple | None = None) -> bool:
+    # Tytuły postów pochodzą od obcych osób, więc pingować wolno wyłącznie skonfigurowaną rolę (bez @everyone itp.)
+    payload = {
+        "content": content,
+        "allowed_mentions": {"parse": [], "roles": [ROLE_ID] if ROLE_ID else []},
+    }
     for attempt in range(3):
         if file_tuple is not None:
             filename, file_bytes, mime = file_tuple
             r = requests.post(
                 webhook_url,
-                data={"payload_json": json.dumps({"content": content})},
+                data={"payload_json": json.dumps(payload)},
                 files={"file": (filename, file_bytes, mime)},
                 timeout=30,
             )
         else:
-            r = requests.post(webhook_url, json={"content": content}, timeout=15)
+            r = requests.post(webhook_url, json=payload, timeout=15)
 
         if r.status_code in (200, 204):
             return True
@@ -423,7 +438,7 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
     title = html.unescape((post_data.get("title") or "").strip())
     if len(title) > 250:
         title = title[:247] + "..."
-    header = f"**{title}**" if title else ""
+    header = message_header(title)
 
     source = unwrap_post_source(post_data)
     raw_url = html.unescape((source.get("url_overridden_by_dest") or source.get("url") or "").strip())
@@ -530,8 +545,7 @@ def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_
     to_send = list(reversed(hot)) or [random.choice(unseen)]
 
     for gif in to_send:
-        header = html.unescape((gif.get("description") or "").strip())[:250]
-        header = f"**{header}**" if header else ""
+        header = message_header(html.unescape((gif.get("description") or "").strip())[:250])
         if send_redgifs(webhook_url, gif["id"], header, gif.get("urls")):
             mark_posted(f"redgifs:{gif['id']}", posted_ids, posted_history)
             print(f"Wysłano film {gif['id']} z niszy RedGifs {niche}")
