@@ -16,6 +16,7 @@ except ImportError:
 
 STATE_FILE = "posted.json"
 MAX_HISTORY = 3000
+TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
@@ -65,7 +66,7 @@ def fetch_via_reddit_direct(sub_name: str, listing: str, extra_params=None):
     if cffi_requests is None or (not REDDIT_COOKIE and not PROXY_URL):
         return None
 
-    params = {"limit": 10 if listing == "new" else 50, "raw_json": 1}
+    params = {"limit": 50, "raw_json": 1}
     if extra_params:
         params.update(extra_params)
 
@@ -104,12 +105,43 @@ def fetch_via_reddit_direct(sub_name: str, listing: str, extra_params=None):
     return None
 
 
-def fetch_via_arctic_shift(sub_name: str, mode: str = "new", before_days: int | None = None):
+def fetch_via_arctic_shift(sub_name: str, mode: str = "top_day", before_days: int | None = None):
     """Fallback niewymagający proxy ani cookies (działa bezpośrednio z IP GitHub Actions)."""
+    if mode == "top_day":
+        seen_posts = {}
+        params = {
+            "subreddit": sub_name,
+            "after": "24h",
+            "sort": "desc",
+            "limit": 100,
+        }
+        # Pobierz posty z ostatnich 24h (maks. 5 stron po 100) i posortuj malejąco po score (odpowiednik top/?t=day)
+        for page in range(5):
+            res = requests.get(ARCTIC_SHIFT_URL, params=params, timeout=20)
+            if res.status_code != 200:
+                if page == 0:
+                    print(f"Błąd Arctic Shift HTTP {res.status_code} dla r/{sub_name}")
+                    return None
+                break
+
+            batch = [p for p in res.json().get("data", []) if isinstance(p, dict) and p.get("id")]
+            for post in batch:
+                seen_posts[post["id"]] = post
+
+            if len(batch) < 100 or not batch[-1].get("created_utc"):
+                break
+            params["before"] = batch[-1]["created_utc"]
+
+        return sorted(
+            seen_posts.values(),
+            key=lambda p: (p.get("score") or 0, p.get("created_utc") or 0),
+            reverse=True,
+        )
+
     params = {
         "subreddit": sub_name,
         "sort": "desc",
-        "limit": 15 if mode == "new" else 100,
+        "limit": 100,
     }
     if before_days is not None:
         params["before"] = f"{before_days}d"
@@ -123,11 +155,11 @@ def fetch_via_arctic_shift(sub_name: str, mode: str = "new", before_days: int | 
     return [post for post in data if isinstance(post, dict)]
 
 
-def fetch_new_posts(sub_name: str):
-    posts = fetch_via_reddit_direct(sub_name, "new")
+def fetch_top_day_posts(sub_name: str):
+    posts = fetch_via_reddit_direct(sub_name, "top", {"t": "day", "limit": 20})
     if posts is not None:
         return posts
-    return fetch_via_arctic_shift(sub_name, mode="new")
+    return fetch_via_arctic_shift(sub_name, mode="top_day")
 
 
 def fetch_older_posts(sub_name: str, posted_ids: set):
@@ -381,30 +413,26 @@ def main():
             continue
 
         try:
-            new_posts = fetch_new_posts(sub_name)
-            if new_posts is None:
+            top_day_posts = fetch_top_day_posts(sub_name)
+            if top_day_posts is None:
                 print(f"Nie udało się pobrać postów dla r/{sub_name}")
                 continue
 
-            if not new_posts:
-                print(f"Brak postów dla r/{sub_name} (sprawdź czy nazwa subreddita jest poprawna)")
-                continue
-
-            # Sprawdź maks. 5 najnowszych poprawnych postów z mediami (od starszego do najnowszego)
-            media_new = [p for p in new_posts if is_valid_media_post(p)][:5]
+            # Sprawdź TOP_DAY_LIMIT najlepszych postów z dzisiaj (top/?t=day) zawierających media
+            media_top_day = [p for p in top_day_posts if is_valid_media_post(p)][:TOP_DAY_LIMIT]
             sent_in_this_run = 0
 
-            for post in reversed(media_new):
+            for post in reversed(media_top_day):
                 post_id = post["id"]
                 if post_id not in posted_ids:
                     if send_post(webhook_url, post):
                         posted_ids.add(post_id)
                         posted_history.append(post_id)
                         sent_in_this_run += 1
-                        print(f"Wysłano nowy post {post_id} z r/{sub_name}")
+                        print(f"Wysłano nowy post z TOP dnia ({post_id}, score={post.get('score', '?')}) z r/{sub_name}")
                         time.sleep(1.5)
 
-            # Fallback: jeśli nie było żadnego nowego posta, wyślij 1 niewysłany starszy post
+            # Fallback: jeśli w TOP dnia nie pojawił się żaden nowy (niewysłany) post, wyślij 1 starszy post z roku
             if sent_in_this_run == 0:
                 time.sleep(1)
                 unseen_old = fetch_older_posts(sub_name, posted_ids)
@@ -415,6 +443,8 @@ def main():
                         posted_ids.add(chosen_id)
                         posted_history.append(chosen_id)
                         print(f"Wysłano starszy post (fallback: {chosen_id}) z r/{sub_name}")
+                else:
+                    print(f"Brak nowych i starszych postów dla r/{sub_name} (sprawdź nazwę subreddita)")
 
             time.sleep(1.5)
         except Exception as e:
