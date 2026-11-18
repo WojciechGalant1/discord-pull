@@ -2,8 +2,8 @@ name: Reddit to Discord Feed
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Uruchamia co 15 minut
-  workflow_dispatch: # Pozwala uruchomić ręcznie jednym przyciskiem do testów
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,13 +16,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install praw requests
+      - run: pip install requests
       - name: Run script
         env:
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
-          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
+          REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
         run: python bot.py
       - name: Save posted history
         run: |
