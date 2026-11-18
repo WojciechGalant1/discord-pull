@@ -1,95 +1,427 @@
-import os
+import html
+import io
 import json
-import time
+import os
 import random
+import re
+import time
+from urllib.parse import urlparse
+
 import requests
 
-CHANNELS = json.loads(os.environ["DISCORD_CHANNELS"])
-
-PROXIES = {
-    "http": os.environ["PROXY_URL"],
-    "https": os.environ["PROXY_URL"]
-}
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 
 STATE_FILE = "posted.json"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Cookie": os.environ["REDDIT_COOKIE"],
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1"
-}
+MAX_HISTORY = 3000
+MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
+ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
-if os.path.exists(STATE_FILE):
-    with open(STATE_FILE, "r") as f:
-        posted_ids = set(json.load(f))
-else:
-    posted_ids = set()
+RAW_CHANNELS = os.environ.get("DISCORD_CHANNELS", "").strip()
+if not RAW_CHANNELS:
+    raise RuntimeError("Brak zmiennej środowiskowej DISCORD_CHANNELS.")
 
-def send_post(webhook_url, post_data):
-    title = post_data.get("title", "")
-    permalink = f"https://www.reddit.com{post_data.get('permalink', '')}"
-    post_url = post_data.get("url") or permalink
-    
-    # Dla galerii Reddita link z permalinkiem lepiej generuje podgląd na Discordzie
-    if "reddit.com/gallery/" in post_url:
-        post_url = permalink
+CHANNELS = json.loads(RAW_CHANNELS)
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+RAW_COOKIE = os.environ.get("REDDIT_COOKIE", "").strip()
 
-    payload = {
-        "content": f"**{title}**\n{post_url}"
-    }
-    r = requests.post(webhook_url, json=payload, timeout=15)
-    if r.status_code not in (200, 204):
-        print(f"Błąd wysyłki na Discorda: {r.status_code} - {r.text}")
+_REDGIFS_TOKEN = None
 
-for sub_name, webhook_url in CHANNELS.items():
-    if "TUTAJ_LINK" in webhook_url:
-        continue
+
+def build_reddit_cookie(raw_cookie: str) -> str:
+    if not raw_cookie:
+        return ""
+    cookie = raw_cookie if "=" in raw_cookie else f"reddit_session={raw_cookie}"
+    if "over18=" not in cookie:
+        cookie = f"{cookie.rstrip('; ')}; over18=1"
+    return cookie
+
+
+REDDIT_COOKIE = build_reddit_cookie(RAW_COOKIE)
+
+
+def load_posted_history():
+    if not os.path.exists(STATE_FILE):
+        return [], set()
     try:
-        # KROK 1: Sprawdź 5 najnowszych postów (NEW)
-        url_new = f"https://old.reddit.com/r/{sub_name}/new.json?limit=5&raw_json=1"
-        res = requests.get(url_new, headers=HEADERS, proxies=PROXIES, timeout=15)
-        
-        if res.status_code != 200:
-            print(f"Błąd HTTP {res.status_code} dla r/{sub_name}")
-            continue
-            
-        new_posts = res.json().get("data", {}).get("children", [])
-        sent_in_this_run = 0
-        
-        for item in reversed(new_posts):
-            post = item["data"]
-            if post["id"] not in posted_ids:
-                send_post(webhook_url, post)
-                posted_ids.add(post["id"])
-                sent_in_this_run += 1
-                time.sleep(1)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            items = list(dict.fromkeys(json.load(f)))
+        return items, set(items)
+    except Exception as e:
+        print(f"Ostrzeżenie: nie udało się wczytać {STATE_FILE}: {e}")
+        return [], set()
 
-        # KROK 2: Jeśli NIE BYŁO żadnych nowych postów, pobierz 1 starszy z TOP (z ostatniego roku)
-        if sent_in_this_run == 0:
-            time.sleep(1)
-            url_old = f"https://old.reddit.com/r/{sub_name}/top.json?t=year&limit=50&raw_json=1"
-            res_old = requests.get(url_old, headers=HEADERS, proxies=PROXIES, timeout=15)
-            
-            if res_old.status_code == 200:
-                old_posts = res_old.json().get("data", {}).get("children", [])
-                # Odfiltruj te, które już kiedyś były wysłane
-                unseen_old = [item["data"] for item in old_posts if item["data"]["id"] not in posted_ids]
-                
+
+def save_posted_history(history_list):
+    trimmed = history_list[-MAX_HISTORY:]
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(trimmed, f)
+
+
+def fetch_via_reddit_direct(sub_name: str, listing: str, extra_params=None):
+    """Próbuje pobrać posty bezpośrednio z api.reddit.com przez curl_cffi (Chrome TLS)."""
+    if cffi_requests is None or (not REDDIT_COOKIE and not PROXY_URL):
+        return None
+
+    params = {"limit": 10 if listing == "new" else 50, "raw_json": 1}
+    if extra_params:
+        params.update(extra_params)
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if REDDIT_COOKIE:
+        headers["Cookie"] = REDDIT_COOKIE
+
+    kwargs = {
+        "headers": headers,
+        "params": params,
+        "impersonate": "chrome",
+        "timeout": 15,
+    }
+    if PROXY_URL:
+        kwargs["proxy"] = PROXY_URL
+
+    for base_url in ("https://api.reddit.com", "https://old.reddit.com"):
+        suffix = "" if base_url == "https://api.reddit.com" else ".json"
+        url = f"{base_url}/r/{sub_name}/{listing}{suffix}"
+        try:
+            res = cffi_requests.get(url, **kwargs)
+            if res.status_code == 200:
+                children = res.json().get("data", {}).get("children", [])
+                return [
+                    child["data"]
+                    for child in children
+                    if isinstance(child, dict) and isinstance(child.get("data"), dict)
+                ]
+            print(f"Info: {base_url} zwrócił HTTP {res.status_code} dla r/{sub_name}, przełączam dalej...")
+        except Exception as e:
+            print(f"Info: błąd połączenia z {base_url} dla r/{sub_name}: {e}")
+
+    return None
+
+
+def fetch_via_arctic_shift(sub_name: str, mode: str = "new", before_days: int | None = None):
+    """Fallback niewymagający proxy ani cookies (działa bezpośrednio z IP GitHub Actions)."""
+    params = {
+        "subreddit": sub_name,
+        "sort": "desc",
+        "limit": 15 if mode == "new" else 100,
+    }
+    if before_days is not None:
+        params["before"] = f"{before_days}d"
+
+    res = requests.get(ARCTIC_SHIFT_URL, params=params, timeout=20)
+    if res.status_code != 200:
+        print(f"Błąd Arctic Shift HTTP {res.status_code} dla r/{sub_name}")
+        return None
+
+    data = res.json().get("data", [])
+    return [post for post in data if isinstance(post, dict)]
+
+
+def fetch_new_posts(sub_name: str):
+    posts = fetch_via_reddit_direct(sub_name, "new")
+    if posts is not None:
+        return posts
+    return fetch_via_arctic_shift(sub_name, mode="new")
+
+
+def fetch_older_posts(sub_name: str, posted_ids: set):
+    posts = fetch_via_reddit_direct(sub_name, "top", {"t": "year"})
+    if posts:
+        unseen = [p for p in posts if p.get("id") not in posted_ids and is_valid_media_post(p)]
+        if unseen:
+            return unseen
+
+    # Najpierw sprawdź starsze posty sprzed >2 dni, a jeśli wszystkie były wysłane — losowe okno z ostatniego roku
+    for before_days in (2, random.randint(14, 300)):
+        posts = fetch_via_arctic_shift(sub_name, mode="old", before_days=before_days)
+        if not posts:
+            continue
+        unseen = [p for p in posts if p.get("id") not in posted_ids and is_valid_media_post(p)]
+        if unseen:
+            return unseen
+    return []
+
+
+def unwrap_post_source(post_data: dict) -> dict:
+    crossposts = post_data.get("crosspost_parent_list")
+    if isinstance(crossposts, list) and crossposts and isinstance(crossposts[0], dict):
+        return crossposts[0]
+    return post_data
+
+
+def is_valid_media_post(post_data: dict) -> bool:
+    if not post_data or not post_data.get("id"):
+        return False
+    if post_data.get("removed_by_category"):
+        return False
+
+    title = (post_data.get("title") or "").strip()
+    if title.lower() in ("[ removed by moderator ]", "[removed]", "[deleted]"):
+        return False
+
+    source = unwrap_post_source(post_data)
+    if source.get("removed_by_category") or source.get("is_self"):
+        return False
+
+    url = (source.get("url_overridden_by_dest") or source.get("url") or "").strip()
+    if not url or "/removed_by_moderator/" in url:
+        return False
+
+    if source.get("is_gallery") or source.get("media_metadata") or "reddit.com/gallery/" in url:
+        return bool(extract_gallery_urls(source))
+
+    if source.get("is_video") or "v.redd.it/" in url or "redgifs.com/" in url:
+        return True
+
+    # Odrzuć zwykłe linki do komentarzy na Reddicie bez obrazu/wideo
+    parsed = urlparse(url)
+    path_lower = parsed.path.lower()
+    if "reddit.com" in parsed.netloc.lower() and "/comments/" in path_lower:
+        return False
+
+    return True
+
+
+def extract_gallery_urls(source: dict) -> list[str]:
+    metadata = source.get("media_metadata")
+    if not isinstance(metadata, dict) or not metadata:
+        return []
+
+    gallery_items = (source.get("gallery_data") or {}).get("items") or []
+    ordered_ids = [
+        item["media_id"]
+        for item in gallery_items
+        if isinstance(item, dict) and not item.get("is_deleted") and item.get("media_id") in metadata
+    ]
+    if not ordered_ids:
+        ordered_ids = list(metadata.keys())
+
+    urls = []
+    for media_id in ordered_ids:
+        meta = metadata.get(media_id) or {}
+        if meta.get("status") != "valid":
+            continue
+        best = meta.get("s") or {}
+        media_url = best.get("gif") or best.get("mp4") or best.get("u")
+        if media_url:
+            urls.append(html.unescape(media_url))
+    return urls
+
+
+def get_redgifs_token() -> str | None:
+    global _REDGIFS_TOKEN
+    if _REDGIFS_TOKEN:
+        return _REDGIFS_TOKEN
+    try:
+        res = requests.get("https://api.redgifs.com/v2/auth/temporary", timeout=10)
+        if res.status_code == 200:
+            _REDGIFS_TOKEN = res.json().get("token")
+    except Exception:
+        pass
+    return _REDGIFS_TOKEN
+
+
+def download_file_within_limit(url: str, headers: dict | None = None) -> bytes | None:
+    req_headers = headers or {}
+    try:
+        head = requests.head(url, headers=req_headers, allow_redirects=True, timeout=10)
+        if head.status_code == 200:
+            cl = head.headers.get("Content-Length")
+            if cl and int(cl) > MAX_UPLOAD_BYTES:
+                return None
+
+        with requests.get(url, headers=req_headers, stream=True, timeout=25) as r:
+            if r.status_code != 200:
+                return None
+            buf = io.BytesIO()
+            total = 0
+            for chunk in r.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    return None
+                buf.write(chunk)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def resolve_redgifs_mp4(gif_id: str) -> bytes | None:
+    global _REDGIFS_TOKEN
+    token = get_redgifs_token()
+    if not token:
+        return None
+
+    api_url = f"https://api.redgifs.com/v2/gifs/{gif_id}"
+    res = requests.get(api_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    if res.status_code == 401:
+        _REDGIFS_TOKEN = None
+        token = get_redgifs_token()
+        if not token:
+            return None
+        res = requests.get(api_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+
+    if res.status_code != 200:
+        return None
+
+    urls = (res.json().get("gif") or {}).get("urls") or {}
+    dl_headers = {"Referer": "https://www.redgifs.com/"}
+    for quality in ("hd", "sd"):
+        mp4_url = urls.get(quality)
+        if mp4_url:
+            video_bytes = download_file_within_limit(mp4_url, headers=dl_headers)
+            if video_bytes:
+                return video_bytes
+    return None
+
+
+def post_to_discord(webhook_url: str, content: str, file_tuple: tuple | None = None) -> bool:
+    for attempt in range(3):
+        if file_tuple is not None:
+            filename, file_bytes, mime = file_tuple
+            r = requests.post(
+                webhook_url,
+                data={"payload_json": json.dumps({"content": content})},
+                files={"file": (filename, file_bytes, mime)},
+                timeout=30,
+            )
+        else:
+            r = requests.post(webhook_url, json={"content": content}, timeout=15)
+
+        if r.status_code in (200, 204):
+            return True
+
+        if r.status_code == 429 and attempt < 2:
+            retry_after = 2.0
+            try:
+                retry_after = float(r.json().get("retry_after", 2.0))
+            except Exception:
+                pass
+            time.sleep(retry_after + 0.5)
+            continue
+
+        print(f"Błąd wysyłki na Discorda: HTTP {r.status_code} - {r.text[:200]}")
+        return False
+    return False
+
+
+def send_post(webhook_url: str, post_data: dict) -> bool:
+    title = html.unescape((post_data.get("title") or "").strip())
+    if len(title) > 250:
+        title = title[:247] + "..."
+    header = f"**{title}**" if title else ""
+
+    source = unwrap_post_source(post_data)
+    raw_url = html.unescape((source.get("url_overridden_by_dest") or source.get("url") or "").strip())
+    path_lower = urlparse(raw_url).path.lower()
+
+    # 1. Galeria Reddita -> bezpośrednie zdjęcia z i.redd.it (w paczkach po 4 na wiadomość)
+    if source.get("is_gallery") or source.get("media_metadata") or "reddit.com/gallery/" in raw_url:
+        gallery_urls = extract_gallery_urls(source)
+        if not gallery_urls:
+            return False
+        ok = False
+        for idx in range(0, len(gallery_urls), 4):
+            chunk = "\n".join(gallery_urls[idx : idx + 4])
+            msg = f"{header}\n{chunk}".strip() if idx == 0 else chunk
+            ok = post_to_discord(webhook_url, msg) or ok
+            if idx + 4 < len(gallery_urls):
+                time.sleep(1)
+        return ok
+
+    # 2. Bezpośredni obrazek / GIF (i.redd.it, imgur itp.)
+    if path_lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+        msg = f"{header}\n{raw_url}".strip()
+        return post_to_discord(webhook_url, msg)
+
+    if path_lower.endswith(".gifv"):
+        mp4_link = raw_url[:-5] + ".mp4"
+        return post_to_discord(webhook_url, f"{header}\n{mp4_link}".strip())
+
+    # 3. RedGifs -> spróbuj wrzucić natywny plik .mp4 (z dźwiękiem), fallback do czystego linku watch
+    if "redgifs.com/" in raw_url.lower():
+        match = re.search(r"redgifs\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)", raw_url, re.IGNORECASE)
+        gif_id = (
+            match.group(1).lower()
+            if match
+            else urlparse(raw_url).path.rstrip("/").split("/")[-1].split(".")[0].lower()
+        )
+        watch_url = f"https://www.redgifs.com/watch/{gif_id}"
+        video_bytes = resolve_redgifs_mp4(gif_id)
+        if video_bytes:
+            return post_to_discord(webhook_url, header, file_tuple=(f"{gif_id}.mp4", video_bytes, "video/mp4"))
+        return post_to_discord(webhook_url, f"{header}\n{watch_url}".strip())
+
+    # 4. Natywne wideo Reddita (v.redd.it)
+    if source.get("is_video") or "v.redd.it/" in raw_url.lower():
+        rv = ((source.get("secure_media") or source.get("media") or {}).get("reddit_video")) or {}
+        fallback_url = html.unescape(rv.get("fallback_url") or "")
+        if fallback_url:
+            video_bytes = download_file_within_limit(fallback_url)
+            if video_bytes:
+                post_id = post_data.get("id", "video")
+                return post_to_discord(webhook_url, header, file_tuple=(f"{post_id}.mp4", video_bytes, "video/mp4"))
+            return post_to_discord(webhook_url, f"{header}\n{fallback_url}".strip())
+
+    # 5. Pozostałe zewnętrzne linki z mediami
+    return post_to_discord(webhook_url, f"{header}\n{raw_url}".strip())
+
+
+def main():
+    posted_history, posted_ids = load_posted_history()
+
+    for raw_sub_name, webhook_url in CHANNELS.items():
+        sub_name = raw_sub_name.strip().removeprefix("/r/").removeprefix("r/").strip("/")
+        if not sub_name or not webhook_url or "TUTAJ_LINK" in webhook_url:
+            continue
+
+        try:
+            new_posts = fetch_new_posts(sub_name)
+            if new_posts is None:
+                print(f"Nie udało się pobrać postów dla r/{sub_name}")
+                continue
+
+            if not new_posts:
+                print(f"Brak postów dla r/{sub_name} (sprawdź czy nazwa subreddita jest poprawna)")
+                continue
+
+            # Sprawdź maks. 5 najnowszych poprawnych postów z mediami (od starszego do najnowszego)
+            media_new = [p for p in new_posts if is_valid_media_post(p)][:5]
+            sent_in_this_run = 0
+
+            for post in reversed(media_new):
+                post_id = post["id"]
+                if post_id not in posted_ids:
+                    if send_post(webhook_url, post):
+                        posted_ids.add(post_id)
+                        posted_history.append(post_id)
+                        sent_in_this_run += 1
+                        print(f"Wysłano nowy post {post_id} z r/{sub_name}")
+                        time.sleep(1.5)
+
+            # Fallback: jeśli nie było żadnego nowego posta, wyślij 1 niewysłany starszy post
+            if sent_in_this_run == 0:
+                time.sleep(1)
+                unseen_old = fetch_older_posts(sub_name, posted_ids)
                 if unseen_old:
                     chosen_post = random.choice(unseen_old)
-                    send_post(webhook_url, chosen_post)
-                    posted_ids.add(chosen_post["id"])
-                    print(f"Wysłano starszy post (fallback) dla r/{sub_name}")
+                    chosen_id = chosen_post["id"]
+                    if send_post(webhook_url, chosen_post):
+                        posted_ids.add(chosen_id)
+                        posted_history.append(chosen_id)
+                        print(f"Wysłano starszy post (fallback: {chosen_id}) z r/{sub_name}")
 
-        time.sleep(2)
-    except Exception as e:
-        print(f"Błąd dla r/{sub_name}: {e}")
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"Błąd dla r/{sub_name}: {e}")
 
-# Zwiększamy pamięć historii do 3000 ID, żeby starsze posty się nie powtarzały
-with open(STATE_FILE, "w") as f:
-    json.dump(list(posted_ids)[-3000:], f)
+    save_posted_history(posted_history)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,13 +1,18 @@
 # discord-pull
 
-Bot wysyła nowe posty z wybranych subredditów na webhooki Discorda co 15 minut.
+Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda co 15 minut przez GitHub Actions.
 
 ## GitHub Secrets
 
-- `DISCORD_CHANNELS` - JSON mapujący nazwy subredditów na webhooki, np.
-  `{"python":"https://discord.com/api/webhooks/...", "pics":"https://discord.com/api/webhooks/..."}`
-- `REDDIT_CLIENT_ID` - ID aplikacji Reddit typu "script"
-- `REDDIT_CLIENT_SECRET` - secret aplikacji Reddit
+Wymagany sekret:
+- `DISCORD_CHANNELS` – JSON mapujący nazwy subredditów na webhooki Discorda, np.:
+  ```json
+  {
+    "PhatAssFemboys": "https://discord.com/api/webhooks/...",
+    "OnlyIfShesPackin": "https://discord.com/api/webhooks/..."
+  }
+  ```
 
-Stwórz aplikację w [Reddit Preferences -> Applications](https://www.reddit.com/prefs/apps),
-następnie dodaj jej dane jako repozytoryjne GitHub Secrets.
+Opcjonalne sekrety (do bezpośredniego odpytywania `api.reddit.com` przed fallbackiem do Arctic Shift):
+- `REDDIT_COOKIE` – wartość ciasteczka `reddit_session` (lub cały nagłówek `Cookie` z przeglądarki)
+- `PROXY_URL` – adres residential proxy (np. `http://user:pass@host:port`), jeśli chcesz łączyć się bezpośrednio z Redditem z ominięciem blokady IP GitHub Actions

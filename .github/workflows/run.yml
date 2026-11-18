@@ -16,11 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests
+      - name: Install dependencies
+        run: pip install requests curl_cffi
       - name: Run script
         env:
-          REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
           DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
+          REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python bot.py
       - name: Save posted history
@@ -28,5 +29,8 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add posted.json
-          git commit -m "Update posted IDs" || exit 0
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Update posted IDs [skip ci]"
+            git pull --rebase origin main
+            git push
+          fi
