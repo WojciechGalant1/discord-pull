@@ -1,6 +1,6 @@
 # discord-pull
 
-Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda co 15 minut przez GitHub Actions.
+Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda co 30 minut przez GitHub Actions.
 
 ## GitHub Secrets
 
