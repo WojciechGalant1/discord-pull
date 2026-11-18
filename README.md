@@ -1,6 +1,6 @@
 # discord-pull
 
-Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda przez GitHub Actions. Co godzinę obsługiwany jest jeden kanał, potem kolejny, w pętli. Przy dwóch kanałach każdy dostaje treść co 2 godziny.
+Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda przez GitHub Actions. Co 10 minut obsługiwany jest jeden kanał, potem kolejny, w pętli. Przy czterech kanałach każdy dostaje treść co 40 minut.
 
 ## GitHub Secrets
 
