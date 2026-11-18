@@ -19,10 +19,9 @@ jobs:
       - run: pip install requests
       - name: Run script
         env:
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USER_AGENT: discord-pull/1.0
+          REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
           DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python bot.py
       - name: Save posted history
         run: |
