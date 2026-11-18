@@ -1,15 +1,22 @@
 # discord-pull
 
-Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda co 30 minut przez GitHub Actions.
+Bot wysyła nowe posty (filmy i obrazki) z wybranych subredditów na webhooki Discorda przez GitHub Actions. Co godzinę obsługiwany jest jeden kanał, potem kolejny, w pętli. Przy dwóch kanałach każdy dostaje treść co 2 godziny.
 
 ## GitHub Secrets
 
-Wymagany sekret:
+Wymagany jest co najmniej jeden z dwóch sekretów (oba trafiają do wspólnej rotacji):
 - `DISCORD_CHANNELS` – JSON mapujący nazwy subredditów na webhooki Discorda, np.:
   ```json
   {
     "PhatAssFemboys": "https://discord.com/api/webhooks/...",
     "OnlyIfShesPackin": "https://discord.com/api/webhooks/..."
+  }
+  ```
+- `REDGIFS_CHANNELS` – JSON mapujący nisze RedGifs na webhooki Discorda. Kluczem jest nazwa niszy albo pełny adres niszy; filmy są pobierane w kolejności `?order=hot`, np.:
+  ```json
+  {
+    "sissy-hypnosis": "https://discord.com/api/webhooks/...",
+    "https://www.redgifs.com/niches/femboys": "https://discord.com/api/webhooks/..."
   }
   ```
 

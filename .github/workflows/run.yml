@@ -2,7 +2,7 @@ name: Reddit to Discord Feed
 
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '7 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -15,16 +15,19 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
       - name: Install dependencies
-        run: pip install requests curl_cffi
+        run: pip install -r requirements.txt
       - name: Run script
         env:
           DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
+          REDGIFS_CHANNELS: ${{ secrets.REDGIFS_CHANNELS }}
           REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python bot.py
@@ -32,9 +35,9 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add posted.json
+          git add posted.json rotation.json
           if ! git diff --cached --quiet; then
-            git commit -m "Update posted IDs [skip ci]"
+            git commit -m "Update feed state [skip ci]"
             git pull --rebase origin main
             git push
           fi

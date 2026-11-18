@@ -15,16 +15,27 @@ except ImportError:
     cffi_requests = None
 
 STATE_FILE = "posted.json"
+ROTATION_FILE = "rotation.json"
 MAX_HISTORY = 3000
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
-RAW_CHANNELS = os.environ.get("DISCORD_CHANNELS", "").strip()
-if not RAW_CHANNELS:
-    raise RuntimeError("Brak zmiennej środowiskowej DISCORD_CHANNELS.")
+def load_channels_env(name: str) -> dict:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} musi być obiektem JSON.")
+    return value
 
-CHANNELS = json.loads(RAW_CHANNELS)
+
+REDDIT_CHANNELS = load_channels_env("DISCORD_CHANNELS")
+REDGIFS_CHANNELS = load_channels_env("REDGIFS_CHANNELS")
+if not REDDIT_CHANNELS and not REDGIFS_CHANNELS:
+    raise RuntimeError("Brak zmiennych środowiskowych DISCORD_CHANNELS i REDGIFS_CHANNELS.")
+
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 RAW_COOKIE = os.environ.get("REDDIT_COOKIE", "").strip()
 
@@ -59,6 +70,48 @@ def save_posted_history(history_list):
     trimmed = history_list[-MAX_HISTORY:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f)
+
+
+def parse_subreddit(raw_key: str) -> str:
+    return raw_key.strip().removeprefix("/r/").removeprefix("r/").strip("/")
+
+
+def parse_redgifs_niche(raw_key: str) -> str:
+    key = raw_key.strip()
+    niche_match = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", key, re.IGNORECASE)
+    if niche_match:
+        return niche_match.group(1).lower()
+    return key.strip("/").lower()
+
+
+def active_channels():
+    channels = []
+    for source, configured, parse in (
+        ("reddit", REDDIT_CHANNELS, parse_subreddit),
+        ("redgifs", REDGIFS_CHANNELS, parse_redgifs_niche),
+    ):
+        for raw_key, webhook_url in configured.items():
+            name = parse(raw_key)
+            if name and webhook_url and "TUTAJ_LINK" not in webhook_url:
+                channels.append((source, name, webhook_url))
+    return channels
+
+
+def load_rotation_index():
+    if not os.path.exists(ROTATION_FILE):
+        return 0
+    try:
+        with open(ROTATION_FILE, "r", encoding="utf-8") as f:
+            value = json.load(f).get("next_index", 0)
+        return value if isinstance(value, int) and value >= 0 else 0
+    except Exception as e:
+        print(f"Ostrzeżenie: nie udało się wczytać {ROTATION_FILE}: {e}")
+        return 0
+
+
+def save_rotation_index(index):
+    with open(ROTATION_FILE, "w", encoding="utf-8") as f:
+        json.dump({"next_index": index}, f)
 
 
 def fetch_via_reddit_direct(sub_name: str, listing: str, extra_params=None):
@@ -283,25 +336,46 @@ def download_file_within_limit(url: str, headers: dict | None = None) -> bytes |
         return None
 
 
-def resolve_redgifs_mp4(gif_id: str) -> bytes | None:
+def redgifs_api_get(path: str, params: dict | None = None) -> dict | None:
     global _REDGIFS_TOKEN
-    token = get_redgifs_token()
-    if not token:
-        return None
-
-    api_url = f"https://api.redgifs.com/v2/gifs/{gif_id}"
-    res = requests.get(api_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-    if res.status_code == 401:
-        _REDGIFS_TOKEN = None
+    for attempt in range(2):
         token = get_redgifs_token()
         if not token:
             return None
-        res = requests.get(api_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        res = requests.get(
+            f"https://api.redgifs.com/v2/{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=15,
+        )
+        if res.status_code == 401 and attempt == 0:
+            _REDGIFS_TOKEN = None
+            continue
+        if res.status_code != 200:
+            print(f"Błąd RedGifs HTTP {res.status_code} dla {path}")
+            return None
+        return res.json()
+    return None
 
-    if res.status_code != 200:
+
+def fetch_redgifs_niche(niche: str):
+    data = redgifs_api_get(f"niches/{niche}/gifs", {"order": "hot", "count": 40})
+    if data is None:
         return None
+    return [
+        gif
+        for gif in data.get("gifs", [])
+        if isinstance(gif, dict) and gif.get("id") and not gif.get("promoted") and gif.get("published", True)
+    ]
 
-    urls = (res.json().get("gif") or {}).get("urls") or {}
+
+def resolve_redgifs_mp4(gif_id: str, urls: dict | None = None) -> bytes | None:
+    if urls is None:
+        data = redgifs_api_get(f"gifs/{gif_id}")
+        if data is None:
+            return None
+        urls = (data.get("gif") or {}).get("urls") or {}
+
     dl_headers = {"Referer": "https://www.redgifs.com/"}
     for quality in ("hd", "sd"):
         mp4_url = urls.get(quality)
@@ -340,6 +414,13 @@ def post_to_discord(webhook_url: str, content: str, file_tuple: tuple | None = N
         print(f"Błąd wysyłki na Discorda: HTTP {r.status_code} - {r.text[:200]}")
         return False
     return False
+
+
+def send_redgifs(webhook_url: str, gif_id: str, header: str, urls: dict | None = None) -> bool:
+    video_bytes = resolve_redgifs_mp4(gif_id, urls)
+    if video_bytes:
+        return post_to_discord(webhook_url, header, file_tuple=(f"{gif_id}.mp4", video_bytes, "video/mp4"))
+    return post_to_discord(webhook_url, f"{header}\nhttps://www.redgifs.com/watch/{gif_id}".strip())
 
 
 def send_post(webhook_url: str, post_data: dict) -> bool:
@@ -383,11 +464,7 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
             if match
             else urlparse(raw_url).path.rstrip("/").split("/")[-1].split(".")[0].lower()
         )
-        watch_url = f"https://www.redgifs.com/watch/{gif_id}"
-        video_bytes = resolve_redgifs_mp4(gif_id)
-        if video_bytes:
-            return post_to_discord(webhook_url, header, file_tuple=(f"{gif_id}.mp4", video_bytes, "video/mp4"))
-        return post_to_discord(webhook_url, f"{header}\n{watch_url}".strip())
+        return send_redgifs(webhook_url, gif_id, header)
 
     # 4. Natywne wideo Reddita (v.redd.it)
     if source.get("is_video") or "v.redd.it/" in raw_url.lower():
@@ -404,53 +481,89 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
     return post_to_discord(webhook_url, f"{header}\n{raw_url}".strip())
 
 
-def main():
-    posted_history, posted_ids = load_posted_history()
+def mark_posted(post_id: str, posted_ids: set, posted_history: list):
+    posted_ids.add(post_id)
+    posted_history.append(post_id)
 
-    for raw_sub_name, webhook_url in CHANNELS.items():
-        sub_name = raw_sub_name.strip().removeprefix("/r/").removeprefix("r/").strip("/")
-        if not sub_name or not webhook_url or "TUTAJ_LINK" in webhook_url:
-            continue
 
-        try:
-            top_day_posts = fetch_top_day_posts(sub_name)
-            if top_day_posts is None:
-                print(f"Nie udało się pobrać postów dla r/{sub_name}")
-                continue
+def process_subreddit(sub_name: str, webhook_url: str, posted_ids: set, posted_history: list):
+    top_day_posts = fetch_top_day_posts(sub_name)
+    if top_day_posts is None:
+        print(f"Nie udało się pobrać postów dla r/{sub_name}")
+        return
 
-            # Sprawdź TOP_DAY_LIMIT najlepszych postów z dzisiaj (top/?t=day) zawierających media
-            media_top_day = [p for p in top_day_posts if is_valid_media_post(p)][:TOP_DAY_LIMIT]
-            sent_in_this_run = 0
+    # Sprawdź TOP_DAY_LIMIT najlepszych postów z dzisiaj (top/?t=day) zawierających media
+    media_top_day = [p for p in top_day_posts if is_valid_media_post(p)][:TOP_DAY_LIMIT]
+    sent_in_this_run = 0
 
-            for post in reversed(media_top_day):
-                post_id = post["id"]
-                if post_id not in posted_ids:
-                    if send_post(webhook_url, post):
-                        posted_ids.add(post_id)
-                        posted_history.append(post_id)
-                        sent_in_this_run += 1
-                        print(f"Wysłano nowy post z TOP dnia ({post_id}, score={post.get('score', '?')}) z r/{sub_name}")
-                        time.sleep(1.5)
-
-            # Fallback: jeśli w TOP dnia nie pojawił się żaden nowy (niewysłany) post, wyślij 1 starszy post z roku
-            if sent_in_this_run == 0:
-                time.sleep(1)
-                unseen_old = fetch_older_posts(sub_name, posted_ids)
-                if unseen_old:
-                    chosen_post = random.choice(unseen_old)
-                    chosen_id = chosen_post["id"]
-                    if send_post(webhook_url, chosen_post):
-                        posted_ids.add(chosen_id)
-                        posted_history.append(chosen_id)
-                        print(f"Wysłano starszy post (fallback: {chosen_id}) z r/{sub_name}")
-                else:
-                    print(f"Brak nowych i starszych postów dla r/{sub_name} (sprawdź nazwę subreddita)")
-
+    for post in reversed(media_top_day):
+        post_id = post["id"]
+        if post_id not in posted_ids and send_post(webhook_url, post):
+            mark_posted(post_id, posted_ids, posted_history)
+            sent_in_this_run += 1
+            print(f"Wysłano nowy post z TOP dnia ({post_id}, score={post.get('score', '?')}) z r/{sub_name}")
             time.sleep(1.5)
-        except Exception as e:
-            print(f"Błąd dla r/{sub_name}: {e}")
+
+    # Fallback: jeśli w TOP dnia nie pojawił się żaden nowy (niewysłany) post, wyślij 1 starszy post z roku
+    if sent_in_this_run == 0:
+        time.sleep(1)
+        unseen_old = fetch_older_posts(sub_name, posted_ids)
+        if not unseen_old:
+            print(f"Brak nowych i starszych postów dla r/{sub_name} (sprawdź nazwę subreddita)")
+            return
+        chosen_post = random.choice(unseen_old)
+        if send_post(webhook_url, chosen_post):
+            mark_posted(chosen_post["id"], posted_ids, posted_history)
+            print(f"Wysłano starszy post (fallback: {chosen_post['id']}) z r/{sub_name}")
+
+
+def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_history: list):
+    gifs = fetch_redgifs_niche(niche)
+    if gifs is None:
+        print(f"Nie udało się pobrać filmów z niszy RedGifs {niche}")
+        return
+
+    # ID z RedGifs są zapisywane z prefiksem, żeby nie mieszały się z ID postów z Reddita
+    unseen = [g for g in gifs if f"redgifs:{g['id']}" not in posted_ids]
+    if not unseen:
+        print(f"Brak nowych filmów w niszy RedGifs {niche}")
+        return
+
+    # Najpierw najwyżej w "hot"; gdy w czołówce wszystko wysłane, losowy niewysłany film z dalszej części listy
+    hot = [g for g in gifs[:TOP_DAY_LIMIT] if f"redgifs:{g['id']}" not in posted_ids]
+    to_send = list(reversed(hot)) or [random.choice(unseen)]
+
+    for gif in to_send:
+        header = html.unescape((gif.get("description") or "").strip())[:250]
+        header = f"**{header}**" if header else ""
+        if send_redgifs(webhook_url, gif["id"], header, gif.get("urls")):
+            mark_posted(f"redgifs:{gif['id']}", posted_ids, posted_history)
+            print(f"Wysłano film {gif['id']} z niszy RedGifs {niche}")
+            time.sleep(1.5)
+
+
+def main():
+    channels = active_channels()
+    if not channels:
+        print("Brak skonfigurowanych kanałów w DISCORD_CHANNELS i REDGIFS_CHANNELS")
+        return
+
+    posted_history, posted_ids = load_posted_history()
+    index = load_rotation_index() % len(channels)
+    source, name, webhook_url = channels[index]
+    label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
+    print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
+
+    try:
+        if source == "redgifs":
+            process_redgifs_niche(name, webhook_url, posted_ids, posted_history)
+        else:
+            process_subreddit(name, webhook_url, posted_ids, posted_history)
+    except Exception as e:
+        print(f"Błąd dla {label}: {e}")
 
     save_posted_history(posted_history)
+    save_rotation_index((index + 1) % len(channels))
 
 
 if __name__ == "__main__":
