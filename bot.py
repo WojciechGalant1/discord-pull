@@ -5,8 +5,8 @@ import requests
 
 # Mapowanie: "nazwa_subreddita_bez_r": "link_do_webhooka_discord"
 CHANNELS = {
-    "StraightToSissy": "https://discord.com/api/webhooks/TUTAJ_LINK_1",
-    "drugi_subreddit": "https://discord.com/api/webhooks/TUTAJ_LINK_2",
+    "PhatAssFemboys": "https://discord.com/api/webhooks/TUTAJ_LINK",
+    "OnlyIfShesPackin": "https://discord.com/api/webhooks/TUTAJ_LINK",
     # dopisz kolejne aż do 9...
 }
 
