@@ -20,6 +20,7 @@ jobs:
       - name: Run script
         env:
           REDDIT_COOKIE: ${{ secrets.REDDIT_COOKIE }}
+          DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
         run: python bot.py
       - name: Save posted history
         run: |
