@@ -28,7 +28,8 @@ jobs:
         env:
           CHANNELS: ${{ secrets.CHANNELS }}
           DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
-          REDGIFS_CHANNELS: ${{ secrets.REDGIFS_CHANNELS }}        run: python bot.py
+          REDGIFS_CHANNELS: ${{ secrets.REDGIFS_CHANNELS }}
+        run: python bot.py
       - name: Save posted history
         run: |
           git config --local user.email "action@github.com"
