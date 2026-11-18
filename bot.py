@@ -9,11 +9,6 @@ from urllib.parse import urlparse
 
 import requests
 
-try:
-    from curl_cffi import requests as cffi_requests
-except ImportError:
-    cffi_requests = None
-
 STATE_FILE = "posted.json"
 ROTATION_FILE = "rotation.json"
 MAX_HISTORY = 3000
@@ -21,37 +16,101 @@ TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać 
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
-def load_channels_env(name: str) -> dict:
+WEBHOOK_PATTERN = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
+REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+
+
+def parse_channel_source(token: str):
+    """Rozpoznaje źródło kanału: r/nazwa, redgifs/nazwa albo pełny adres subreddita / niszy RedGifs."""
+    token = token.strip()
+    niche = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", token, re.IGNORECASE)
+    if niche:
+        return "redgifs", niche.group(1).lower()
+    subreddit = re.search(r"reddit\.com/r/([A-Za-z0-9_]+)", token, re.IGNORECASE)
+    if subreddit:
+        return "reddit", subreddit.group(1)
+    short = re.fullmatch(r"(r|redgifs)[/:]([A-Za-z0-9_-]+)/?", token.lstrip("/"), re.IGNORECASE)
+    if short:
+        if short.group(1).lower() == "redgifs":
+            return "redgifs", short.group(2).lower()
+        return "reddit", short.group(2)
+    return None
+
+
+def load_line_channels(name: str) -> list:
+    raw = os.environ.get(name, "").strip()
+    channels = []
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"(\S+?)\s*=?\s*(https?://\S+)", line)
+        if not match:
+            print(f"Błąd w sekrecie {name}, linijka {line_no}: oczekiwano 'r/nazwa ADRES_WEBHOOKA' albo 'redgifs/nazwa ADRES_WEBHOOKA'. Pomijam.")
+            continue
+        source = parse_channel_source(match.group(1))
+        if source is None:
+            print(f"Błąd w sekrecie {name}, linijka {line_no}: nie rozpoznano źródła '{match.group(1)}' (użyj r/nazwa albo redgifs/nazwa). Pomijam.")
+            continue
+        channels.append((*source, match.group(2)))
+    return channels
+
+
+def load_json_channels(name: str, source: str, parse) -> list:
     raw = os.environ.get(name, "").strip()
     if not raw:
-        return {}
-    value = json.loads(raw)
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Błąd: sekret {name} nie jest poprawnym JSON-em ({e}). Pomijam go.")
+        return []
     if not isinstance(value, dict):
-        raise RuntimeError(f"{name} musi być obiektem JSON.")
-    return value
+        print(f"Błąd: sekret {name} musi być obiektem JSON {{\"nazwa\": \"webhook\"}}. Pomijam go.")
+        return []
+    return [(source, parse(key), webhook_url) for key, webhook_url in value.items()]
 
 
-REDDIT_CHANNELS = load_channels_env("DISCORD_CHANNELS")
-REDGIFS_CHANNELS = load_channels_env("REDGIFS_CHANNELS")
-if not REDDIT_CHANNELS and not REDGIFS_CHANNELS:
-    raise RuntimeError("Brak zmiennych środowiskowych DISCORD_CHANNELS i REDGIFS_CHANNELS.")
+def parse_subreddit(raw_key: str) -> str:
+    return raw_key.strip().removeprefix("/r/").removeprefix("r/").strip("/")
 
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
-RAW_COOKIE = os.environ.get("REDDIT_COOKIE", "").strip()
+
+def parse_redgifs_niche(raw_key: str) -> str:
+    key = raw_key.strip()
+    niche_match = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", key, re.IGNORECASE)
+    if niche_match:
+        return niche_match.group(1).lower()
+    return key.strip("/").lower()
+
+
+def load_channels() -> list:
+    configured = (
+        load_line_channels("CHANNELS")
+        + load_json_channels("DISCORD_CHANNELS", "reddit", parse_subreddit)
+        + load_json_channels("REDGIFS_CHANNELS", "redgifs", parse_redgifs_niche)
+    )
+    channels = []
+    for source, name, webhook_url in configured:
+        webhook_url = str(webhook_url or "").strip()
+        if not name or "TUTAJ_LINK" in webhook_url:
+            continue
+        if not WEBHOOK_PATTERN.match(webhook_url):
+            print(f"Błąd: kanał {source}/{name} nie ma poprawnego adresu webhooka Discorda. Pomijam go.")
+            continue
+        if (source, name, webhook_url) not in channels:
+            channels.append((source, name, webhook_url))
+    return channels
+
+
+CHANNELS = load_channels()
+if not CHANNELS:
+    raise RuntimeError(
+        "Brak skonfigurowanych kanałów. Dodaj sekret CHANNELS, np.:\n"
+        "r/NazwaSubreddita https://discord.com/api/webhooks/...\n"
+        "redgifs/nazwa-niszy https://discord.com/api/webhooks/..."
+    )
 
 _REDGIFS_TOKEN = None
-
-
-def build_reddit_cookie(raw_cookie: str) -> str:
-    if not raw_cookie:
-        return ""
-    cookie = raw_cookie if "=" in raw_cookie else f"reddit_session={raw_cookie}"
-    if "over18=" not in cookie:
-        cookie = f"{cookie.rstrip('; ')}; over18=1"
-    return cookie
-
-
-REDDIT_COOKIE = build_reddit_cookie(RAW_COOKIE)
 
 
 def load_posted_history():
@@ -72,29 +131,16 @@ def save_posted_history(history_list):
         json.dump(trimmed, f)
 
 
-def parse_subreddit(raw_key: str) -> str:
-    return raw_key.strip().removeprefix("/r/").removeprefix("r/").strip("/")
-
-
-def parse_redgifs_niche(raw_key: str) -> str:
-    key = raw_key.strip()
-    niche_match = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", key, re.IGNORECASE)
-    if niche_match:
-        return niche_match.group(1).lower()
-    return key.strip("/").lower()
-
-
-def active_channels():
-    channels = []
-    for source, configured, parse in (
-        ("reddit", REDDIT_CHANNELS, parse_subreddit),
-        ("redgifs", REDGIFS_CHANNELS, parse_redgifs_niche),
-    ):
-        for raw_key, webhook_url in configured.items():
-            name = parse(raw_key)
-            if name and webhook_url and "TUTAJ_LINK" not in webhook_url:
-                channels.append((source, name, webhook_url))
-    return channels
+def state_is_from_other_repo() -> bool:
+    """Stan skopiowany razem z szablonem należy do innego repozytorium i nie może blokować wysyłki."""
+    if not REPOSITORY or not os.path.exists(ROTATION_FILE):
+        return False
+    try:
+        with open(ROTATION_FILE, "r", encoding="utf-8") as f:
+            owner = json.load(f).get("repository")
+    except Exception:
+        return False
+    return bool(owner) and owner != REPOSITORY
 
 
 def load_rotation_index():
@@ -110,56 +156,15 @@ def load_rotation_index():
 
 
 def save_rotation_index(index):
+    state = {"next_index": index}
+    if REPOSITORY:
+        state["repository"] = REPOSITORY
     with open(ROTATION_FILE, "w", encoding="utf-8") as f:
-        json.dump({"next_index": index}, f)
-
-
-def fetch_via_reddit_direct(sub_name: str, listing: str, extra_params=None):
-    """Próbuje pobrać posty bezpośrednio z api.reddit.com przez curl_cffi (Chrome TLS)."""
-    if cffi_requests is None or (not REDDIT_COOKIE and not PROXY_URL):
-        return None
-
-    params = {"limit": 50, "raw_json": 1}
-    if extra_params:
-        params.update(extra_params)
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    if REDDIT_COOKIE:
-        headers["Cookie"] = REDDIT_COOKIE
-
-    kwargs = {
-        "headers": headers,
-        "params": params,
-        "impersonate": "chrome",
-        "timeout": 15,
-    }
-    if PROXY_URL:
-        kwargs["proxy"] = PROXY_URL
-
-    for base_url in ("https://api.reddit.com", "https://old.reddit.com"):
-        suffix = "" if base_url == "https://api.reddit.com" else ".json"
-        url = f"{base_url}/r/{sub_name}/{listing}{suffix}"
-        try:
-            res = cffi_requests.get(url, **kwargs)
-            if res.status_code == 200:
-                children = res.json().get("data", {}).get("children", [])
-                return [
-                    child["data"]
-                    for child in children
-                    if isinstance(child, dict) and isinstance(child.get("data"), dict)
-                ]
-            print(f"Info: {base_url} zwrócił HTTP {res.status_code} dla r/{sub_name}, przełączam dalej...")
-        except Exception as e:
-            print(f"Info: błąd połączenia z {base_url} dla r/{sub_name}: {e}")
-
-    return None
+        json.dump(state, f)
 
 
 def fetch_via_arctic_shift(sub_name: str, mode: str = "top_day", before_days: int | None = None):
-    """Fallback niewymagający proxy ani cookies (działa bezpośrednio z IP GitHub Actions)."""
+    """Reddit blokuje adresy IP GitHub Actions, więc posty są pobierane z publicznego archiwum Arctic Shift."""
     if mode == "top_day":
         seen_posts = {}
         params = {
@@ -209,19 +214,10 @@ def fetch_via_arctic_shift(sub_name: str, mode: str = "top_day", before_days: in
 
 
 def fetch_top_day_posts(sub_name: str):
-    posts = fetch_via_reddit_direct(sub_name, "top", {"t": "day", "limit": 20})
-    if posts is not None:
-        return posts
     return fetch_via_arctic_shift(sub_name, mode="top_day")
 
 
 def fetch_older_posts(sub_name: str, posted_ids: set):
-    posts = fetch_via_reddit_direct(sub_name, "top", {"t": "year"})
-    if posts:
-        unseen = [p for p in posts if p.get("id") not in posted_ids and is_valid_media_post(p)]
-        if unseen:
-            return unseen
-
     # Najpierw sprawdź starsze posty sprzed >2 dni, a jeśli wszystkie były wysłane — losowe okno z ostatniego roku
     for before_days in (2, random.randint(14, 300)):
         posts = fetch_via_arctic_shift(sub_name, mode="old", before_days=before_days)
@@ -543,13 +539,15 @@ def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_
 
 
 def main():
-    channels = active_channels()
-    if not channels:
-        print("Brak skonfigurowanych kanałów w DISCORD_CHANNELS i REDGIFS_CHANNELS")
-        return
+    channels = CHANNELS
 
-    posted_history, posted_ids = load_posted_history()
-    index = load_rotation_index() % len(channels)
+    if state_is_from_other_repo():
+        print("Pliki stanu pochodzą z innego repozytorium (kopia z szablonu). Zaczynam od zera.")
+        posted_history, posted_ids = [], set()
+        index = 0
+    else:
+        posted_history, posted_ids = load_posted_history()
+        index = load_rotation_index() % len(channels)
     source, name, webhook_url = channels[index]
     label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
     print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
