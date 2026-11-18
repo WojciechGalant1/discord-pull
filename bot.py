@@ -4,11 +4,7 @@ import time
 import random
 import requests
 
-CHANNELS = {
-    "PhatAssFemboys": "https://discord.com/api/webhooks/TUTAJ_LINK",
-    "OnlyIfShesPackin": "https://discord.com/api/webhooks/TUTAJ_LINK",
-    # dopisz kolejne aż do 9...
-}
+CHANNELS = json.loads(os.environ["DISCORD_CHANNELS"])
 
 STATE_FILE = "posted.json"
 HEADERS = {
