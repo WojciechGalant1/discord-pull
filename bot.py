@@ -15,6 +15,15 @@ MAX_HISTORY = 3000
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
+MAX_FILES_PER_MESSAGE = 10  # Limit załączników w jednej wiadomości Discorda
+MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+}
 ROLE_ID = "1572719490435653813"  # Rola oznaczana w każdym poście; pusty tekst wyłącza oznaczanie
 
 WEBHOOK_PATTERN = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
@@ -392,20 +401,19 @@ def message_header(title: str) -> str:
     return " ".join(parts)
 
 
-def post_to_discord(webhook_url: str, content: str, file_tuple: tuple | None = None) -> bool:
+def post_to_discord(webhook_url: str, content: str, files: list[tuple] | None = None) -> bool:
     # Tytuły postów pochodzą od obcych osób, więc pingować wolno wyłącznie skonfigurowaną rolę (bez @everyone itp.)
     payload = {
         "content": content,
         "allowed_mentions": {"parse": [], "roles": [ROLE_ID] if ROLE_ID else []},
     }
     for attempt in range(3):
-        if file_tuple is not None:
-            filename, file_bytes, mime = file_tuple
+        if files:
             r = requests.post(
                 webhook_url,
                 data={"payload_json": json.dumps(payload)},
-                files={"file": (filename, file_bytes, mime)},
-                timeout=30,
+                files={f"files[{i}]": file for i, file in enumerate(files)},
+                timeout=60,
             )
         else:
             r = requests.post(webhook_url, json=payload, timeout=15)
@@ -427,11 +435,58 @@ def post_to_discord(webhook_url: str, content: str, file_tuple: tuple | None = N
     return False
 
 
+def media_file(url: str, data: bytes, fallback_name: str) -> tuple:
+    name = os.path.basename(urlparse(url).path) or fallback_name
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in MEDIA_TYPES:
+        ext = ".mp4" if "format=mp4" in url else ".jpg"
+        name = f"{fallback_name}{ext}"
+    return name, data, MEDIA_TYPES[ext]
+
+
+def post_with_links(webhook_url: str, header: str, links: list[str]) -> bool:
+    # Discord ukrywa adres tylko wtedy, gdy wiadomość zawiera sam link, więc tytuł idzie osobno
+    ok = post_to_discord(webhook_url, header) if header else False
+    for link in links:
+        ok = post_to_discord(webhook_url, link) or ok
+    return ok
+
+
+def send_media(webhook_url: str, header: str, urls: list[str], name_prefix: str) -> bool:
+    """Wysyła media jako załączniki (bez widocznych linków); pliki, których nie da się pobrać, idą jako same linki."""
+    attachments, links = [], []
+    for i, url in enumerate(urls):
+        data = download_file_within_limit(url)
+        if data:
+            attachments.append(media_file(url, data, f"{name_prefix}_{i + 1}"))
+        else:
+            links.append(url)
+
+    batches, current, size = [], [], 0
+    for file in attachments:
+        if current and (len(current) == MAX_FILES_PER_MESSAGE or size + len(file[1]) > MAX_UPLOAD_BYTES):
+            batches.append(current)
+            current, size = [], 0
+        current.append(file)
+        size += len(file[1])
+    if current:
+        batches.append(current)
+
+    if not batches:
+        return post_with_links(webhook_url, header, links)
+
+    ok = False
+    for idx, batch in enumerate(batches):
+        ok = post_to_discord(webhook_url, header if idx == 0 else "", files=batch) or ok
+        time.sleep(1)
+    return post_with_links(webhook_url, "", links) or ok
+
+
 def send_redgifs(webhook_url: str, gif_id: str, header: str, urls: dict | None = None) -> bool:
     video_bytes = resolve_redgifs_mp4(gif_id, urls)
     if video_bytes:
-        return post_to_discord(webhook_url, header, file_tuple=(f"{gif_id}.mp4", video_bytes, "video/mp4"))
-    return post_to_discord(webhook_url, f"{header}\nhttps://www.redgifs.com/watch/{gif_id}".strip())
+        return post_to_discord(webhook_url, header, files=[(f"{gif_id}.mp4", video_bytes, "video/mp4")])
+    return post_with_links(webhook_url, header, [f"https://www.redgifs.com/watch/{gif_id}"])
 
 
 def send_post(webhook_url: str, post_data: dict) -> bool:
@@ -444,28 +499,21 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
     raw_url = html.unescape((source.get("url_overridden_by_dest") or source.get("url") or "").strip())
     path_lower = urlparse(raw_url).path.lower()
 
-    # 1. Galeria Reddita -> bezpośrednie zdjęcia z i.redd.it (w paczkach po 4 na wiadomość)
+    post_id = post_data.get("id", "post")
+
+    # 1. Galeria Reddita -> zdjęcia z i.redd.it jako załączniki
     if source.get("is_gallery") or source.get("media_metadata") or "reddit.com/gallery/" in raw_url:
         gallery_urls = extract_gallery_urls(source)
         if not gallery_urls:
             return False
-        ok = False
-        for idx in range(0, len(gallery_urls), 4):
-            chunk = "\n".join(gallery_urls[idx : idx + 4])
-            msg = f"{header}\n{chunk}".strip() if idx == 0 else chunk
-            ok = post_to_discord(webhook_url, msg) or ok
-            if idx + 4 < len(gallery_urls):
-                time.sleep(1)
-        return ok
+        return send_media(webhook_url, header, gallery_urls, post_id)
 
     # 2. Bezpośredni obrazek / GIF (i.redd.it, imgur itp.)
     if path_lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
-        msg = f"{header}\n{raw_url}".strip()
-        return post_to_discord(webhook_url, msg)
+        return send_media(webhook_url, header, [raw_url], post_id)
 
     if path_lower.endswith(".gifv"):
-        mp4_link = raw_url[:-5] + ".mp4"
-        return post_to_discord(webhook_url, f"{header}\n{mp4_link}".strip())
+        return send_media(webhook_url, header, [raw_url[:-5] + ".mp4"], post_id)
 
     # 3. RedGifs -> spróbuj wrzucić natywny plik .mp4 (z dźwiękiem), fallback do czystego linku watch
     if "redgifs.com/" in raw_url.lower():
@@ -482,14 +530,10 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
         rv = ((source.get("secure_media") or source.get("media") or {}).get("reddit_video")) or {}
         fallback_url = html.unescape(rv.get("fallback_url") or "")
         if fallback_url:
-            video_bytes = download_file_within_limit(fallback_url)
-            if video_bytes:
-                post_id = post_data.get("id", "video")
-                return post_to_discord(webhook_url, header, file_tuple=(f"{post_id}.mp4", video_bytes, "video/mp4"))
-            return post_to_discord(webhook_url, f"{header}\n{fallback_url}".strip())
+            return send_media(webhook_url, header, [fallback_url], post_id)
 
     # 5. Pozostałe zewnętrzne linki z mediami
-    return post_to_discord(webhook_url, f"{header}\n{raw_url}".strip())
+    return post_with_links(webhook_url, header, [raw_url])
 
 
 def mark_posted(post_id: str, posted_ids: set, posted_history: list):
