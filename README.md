@@ -2,7 +2,7 @@
 
 Bot wysyła filmy i obrazki z wybranych subredditów oraz nisz RedGifs na kanały Discorda. Działa w GitHub Actions, bez własnego serwera, a listę źródeł użytkownicy serwera ustawiają wiadomościami na kanale `#bot-config`.
 
-Każde uruchomienie obsługuje jeden kanał, a następne bierze kolejny, w pętli. Z subredditów brane są najlepsze posty dnia (`top/?t=day`), z RedGifs filmy z niszy w kolejności `?order=hot`. Gdy nie ma nic nowego, bot wysyła jeden starszy, jeszcze niewysłany post. Wysłane ID są zapisywane w `posted.json`, więc nic się nie powtarza.
+Każde uruchomienie obsługuje 5 kolejnych źródeł, a następne bierze kolejne, w pętli. Z subredditów brane są najlepsze posty dnia (`top/?t=day`), z RedGifs filmy z niszy w kolejności `?order=hot`. Gdy nie ma nic nowego, bot wysyła jeden starszy, jeszcze niewysłany post. Wysłane ID są zapisywane w `posted.json`, więc nic się nie powtarza.
 
 ## Instrukcja krok po kroku
 
@@ -93,8 +93,9 @@ Jeśli używasz cron-job.org, usuń z `.github/workflows/run.yml` sekcję `sched
 
 ## Rotacja kanałów
 
-Źródła są obsługiwane po kolei, jedno na uruchomienie, w kolejności wiadomości na `#bot-config` (od najstarszej) i linijek w nich. Przy czterech kanałach i uruchamianiu co 30 minut każdy kanał dostaje nowe treści co 2 godziny.
+Źródła są obsługiwane po kolei, po 5 na uruchomienie, w kolejności wiadomości na `#bot-config` (od najstarszej) i linijek w nich. Przy 15 źródłach i uruchamianiu co 30 minut każde źródło dostaje nowe treści co 1,5 godziny.
 
 Ustawienia w `bot.py`:
+- `SOURCES_PER_RUN` – ile źródeł obsłużyć w jednym przebiegu (domyślnie 5). Większa wartość to dłuższe przebiegi i więcej zużytych minut Actions.
 - `TOP_DAY_LIMIT` – ile najlepszych postów z czołówki sprawdzać w jednym przebiegu (domyślnie 5).
 - `MAX_UPLOAD_BYTES` – filmy mniejsze niż ten limit są wysyłane jako plik MP4, większe jako link.

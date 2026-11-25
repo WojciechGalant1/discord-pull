@@ -12,6 +12,7 @@ import requests
 STATE_FILE = "posted.json"
 ROTATION_FILE = "rotation.json"
 MAX_HISTORY = 3000
+SOURCES_PER_RUN = 5  # Ile kolejnych źródeł z kolejki obsłużyć w jednym przebiegu
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit załącznika na serwerze bez boostów (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
@@ -698,20 +699,23 @@ def main():
     else:
         posted_history, posted_ids = load_posted_history()
         index = load_rotation_index() % len(channels)
-    source, name, channel_id = channels[index]
-    label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
-    print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
 
-    try:
-        if source == "redgifs":
-            process_redgifs_niche(name, channel_id, posted_ids, posted_history)
-        else:
-            process_subreddit(name, channel_id, posted_ids, posted_history)
-    except Exception as e:
-        print(f"Błąd dla {label}: {e}")
+    for _ in range(min(SOURCES_PER_RUN, len(channels))):
+        source, name, channel_id = channels[index]
+        label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
+        print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
+        try:
+            if source == "redgifs":
+                process_redgifs_niche(name, channel_id, posted_ids, posted_history)
+            else:
+                process_subreddit(name, channel_id, posted_ids, posted_history)
+        except Exception as e:
+            print(f"Błąd dla {label}: {e}")
 
-    save_posted_history(posted_history)
-    save_rotation_index((index + 1) % len(channels))
+        # Zapis po każdym źródle, żeby przerwany przebieg nie zgubił tego, co już wysłano
+        index = (index + 1) % len(channels)
+        save_posted_history(posted_history)
+        save_rotation_index(index)
 
 
 if __name__ == "__main__":

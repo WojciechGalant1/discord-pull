@@ -15,7 +15,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,11 +25,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run script
+        timeout-minutes: 8
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           CONFIG_CHANNEL: ${{ vars.CONFIG_CHANNEL }}
         run: python bot.py
       - name: Save posted history
+        if: ${{ !cancelled() }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
