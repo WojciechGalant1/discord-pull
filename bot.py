@@ -15,6 +15,7 @@ MAX_HISTORY = 3000
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
+REDGIFS_TOP_MAX_PAGE = 10  # Z ilu pierwszych stron (po 40 filmów) najpopularniejszych losować fallback
 MAX_FILES_PER_MESSAGE = 10  # Limit załączników w jednej wiadomości Discorda
 MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -364,15 +365,29 @@ def redgifs_api_get(path: str, params: dict | None = None) -> dict | None:
     return None
 
 
-def fetch_redgifs_niche(niche: str):
-    data = redgifs_api_get(f"niches/{niche}/gifs", {"order": "hot", "count": 40})
+def fetch_redgifs_niche(niche: str, order: str = "hot", page: int = 1):
+    """Zwraca (filmy, liczba_stron) albo (None, 0) przy błędzie."""
+    data = redgifs_api_get(f"niches/{niche}/gifs", {"order": order, "count": 40, "page": page})
     if data is None:
-        return None
-    return [
+        return None, 0
+    gifs = [
         gif
         for gif in data.get("gifs", [])
         if isinstance(gif, dict) and gif.get("id") and not gif.get("promoted") and gif.get("published", True)
     ]
+    return gifs, data.get("pages") or 1
+
+
+def fetch_redgifs_top_unseen(niche: str, posted_ids: set) -> list:
+    # Pierwsza strona najpopularniejszych (?order=top), a gdy wszystko z niej było, losowa dalsza strona
+    gifs, pages = fetch_redgifs_niche(niche, "top", 1)
+    if not gifs:
+        return []
+    unseen = [g for g in gifs if f"redgifs:{g['id']}" not in posted_ids]
+    if unseen or pages < 2:
+        return unseen
+    gifs, _ = fetch_redgifs_niche(niche, "top", random.randint(2, min(pages, REDGIFS_TOP_MAX_PAGE)))
+    return [g for g in gifs or [] if f"redgifs:{g['id']}" not in posted_ids]
 
 
 def resolve_redgifs_mp4(gif_id: str, urls: dict | None = None) -> bytes | None:
@@ -573,20 +588,27 @@ def process_subreddit(sub_name: str, webhook_url: str, posted_ids: set, posted_h
 
 
 def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_history: list):
-    gifs = fetch_redgifs_niche(niche)
+    gifs, _ = fetch_redgifs_niche(niche)
     if gifs is None:
         print(f"Nie udało się pobrać filmów z niszy RedGifs {niche}")
         return
 
     # ID z RedGifs są zapisywane z prefiksem, żeby nie mieszały się z ID postów z Reddita
     unseen = [g for g in gifs if f"redgifs:{g['id']}" not in posted_ids]
-    if not unseen:
-        print(f"Brak nowych filmów w niszy RedGifs {niche}")
-        return
 
-    # Najpierw najwyżej w "hot"; gdy w czołówce wszystko wysłane, losowy niewysłany film z dalszej części listy
+    # Najpierw najwyżej w "hot"; potem losowy niewysłany z dalszej części "hot"; na końcu fallback z najpopularniejszych
     hot = [g for g in gifs[:TOP_DAY_LIMIT] if f"redgifs:{g['id']}" not in posted_ids]
-    to_send = list(reversed(hot)) or [random.choice(unseen)]
+    if hot:
+        to_send = list(reversed(hot))
+    elif unseen:
+        to_send = [random.choice(unseen)]
+    else:
+        top_unseen = fetch_redgifs_top_unseen(niche, posted_ids)
+        if not top_unseen:
+            print(f"Brak nowych filmów w niszy RedGifs {niche}, także wśród najpopularniejszych")
+            return
+        to_send = [random.choice(top_unseen)]
+        print(f"Brak nowych filmów w \"hot\" – wysyłam film z najpopularniejszych (fallback) w niszy {niche}")
 
     for gif in to_send:
         header = message_header(html.unescape((gif.get("description") or "").strip())[:250])
