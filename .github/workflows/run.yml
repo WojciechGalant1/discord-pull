@@ -34,9 +34,32 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add posted.json rotation.json
-          if ! git diff --cached --quiet; then
+          cp posted.json /tmp/posted.json
+          cp rotation.json /tmp/rotation.json
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            python - <<'EOF'
+          import json
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return []
+          merged = list(dict.fromkeys(load("posted.json") + load("/tmp/posted.json")))[-3000:]
+          with open("posted.json", "w", encoding="utf-8") as f:
+              json.dump(merged, f)
+          EOF
+            cp /tmp/rotation.json rotation.json
+            git add posted.json rotation.json
+            if git diff --cached --quiet; then
+              exit 0
+            fi
             git commit -m "Update feed state [skip ci]"
-            git pull --rebase origin main
-            git push
-          fi
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+          exit 1
