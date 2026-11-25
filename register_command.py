@@ -9,15 +9,15 @@ HEADERS = {"Authorization": f"Bot {os.environ['DISCORD_TOKEN'].strip()}"}
 COMMANDS = [
     {
         "name": "when",
-        "description": "Za ile pojawią się nowe treści na kanale",
+        "description": "When new content will be posted in a channel",
         "type": 1,
         "contexts": [0],
         "integration_types": [0],
         "options": [
             {
                 "type": 7,
-                "name": "kanal",
-                "description": "Kanał do sprawdzenia (domyślnie bieżący)",
+                "name": "channel",
+                "description": "Channel to check (defaults to the current one)",
                 "required": False,
                 "channel_types": [0, 5],
             }

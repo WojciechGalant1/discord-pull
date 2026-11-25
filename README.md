@@ -93,7 +93,7 @@ Jeśli używasz cron-job.org, usuń z `.github/workflows/run.yml` sekcję `sched
 
 ## Komenda /when (opcjonalnie)
 
-`/when` pokazuje, za ile mniej więcej pojawią się nowe treści na kanale, na którym ją wpiszesz (albo na kanale wybranym w opcji `kanal`). Na kanale bez źródeł pokazuje wszystkie. Odpowiedź widzi tylko osoba, która wpisała komendę, a czas odlicza się na żywo.
+`/when` pokazuje, za ile mniej więcej pojawią się nowe treści na kanale, na którym ją wpiszesz (albo na kanale wybranym w opcji `channel`). Na kanale bez źródeł pokazuje wszystkie. Odpowiedź widzi tylko osoba, która wpisała komendę, a czas odlicza się na żywo. Teksty komendy są po angielsku; same odliczania („in 20 minutes”) Discord wyświetla w języku aplikacji każdego użytkownika.
 
 Bot działa tylko w czasie przebiegów GitHub Actions, więc na komendy odpowiada darmowy Cloudflare Worker, który czyta plik `schedule.json` zapisywany przez bota po każdym przebiegu.
 

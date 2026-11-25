@@ -6,7 +6,7 @@ const EPHEMERAL = 64;
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
-      return new Response("discord-pull: Worker działa");
+      return new Response("discord-pull: Worker is running");
     }
 
     const signature = request.headers.get("X-Signature-Ed25519");
@@ -23,7 +23,7 @@ export default {
     if (interaction.type === 2 && interaction.data.name === "when") {
       return message(await scheduleText(env, interaction));
     }
-    return message("Nieznana komenda.");
+    return message("Unknown command.");
   },
 };
 
@@ -57,7 +57,7 @@ async function scheduleText(env, interaction) {
     },
   });
   if (!res.ok) {
-    return `Nie udało się odczytać harmonogramu (GitHub HTTP ${res.status}).`;
+    return `Could not read the schedule (GitHub HTTP ${res.status}).`;
   }
   const schedule = await res.json();
 
@@ -66,17 +66,17 @@ async function scheduleText(env, interaction) {
   // Gdy GitHub spóźnia się z uruchomieniem, następny przebieg liczymy od teraz, a nie od zaległego terminu
   const nextRun = Math.max(schedule.last_run + interval, now + 60);
 
-  const chosen = interaction.data.options?.find((option) => option.name === "kanal")?.value;
+  const chosen = interaction.data.options?.find((option) => option.name === "channel")?.value;
   const channelId = chosen || interaction.channel_id;
   const forChannel = schedule.sources.filter((source) => source.channel_id === channelId);
   const sources = forChannel.length ? forChannel : schedule.sources;
 
-  const lines = [forChannel.length ? `**Następne wysyłki na <#${channelId}>:**` : "**Następne wysyłki:**"];
+  const lines = [forChannel.length ? `**Next posts in <#${channelId}>:**` : "**Next posts:**"];
   for (const source of sources) {
     const when = `<t:${nextRun + source.runs_ahead * interval}:R>`;
     lines.push(forChannel.length ? `\`${source.source}\` ${when}` : `\`${source.source}\` → <#${source.channel_id}> ${when}`);
   }
-  lines.push("", `Ostatni przebieg bota: <t:${schedule.last_run}:R>. Czasy są przybliżone.`);
+  lines.push("", `Last bot run: <t:${schedule.last_run}:R>. Times are approximate.`);
 
   let content = lines.join("\n");
   if (content.length > 2000) {
