@@ -5,19 +5,21 @@ import os
 import random
 import re
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import requests
 
 STATE_FILE = "posted.json"
 ROTATION_FILE = "rotation.json"
 SCHEDULE_FILE = "schedule.json"
-MAX_HISTORY = 3000
+SOURCES_FILE = "sources.json"
+MAX_HISTORY = 6000  # Każdy wysłany post zajmuje 1–3 wpisy (ID posta, ID oryginału, adres mediów)
 SOURCES_PER_RUN = 5  # Ile kolejnych źródeł z kolejki obsłużyć w jednym przebiegu
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
 MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit załącznika na serwerze bez boostów (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 REDGIFS_TOP_MAX_PAGE = 10  # Z ilu pierwszych stron (po 40 filmów) najpopularniejszych losować fallback
+USER_HISTORY_PAGES = 5  # Ile stron (po 100 postów) historii użytkownika Reddita przeszukać w fallbacku
 MAX_FILES_PER_MESSAGE = 10  # Limit załączników w jednej wiadomości Discorda
 MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -28,6 +30,7 @@ MEDIA_TYPES = {
     ".mp4": "video/mp4",
 }
 ROLE_ID = "1572719490435653813"  # Rola oznaczana w każdym poście; pusty tekst wyłącza oznaczanie
+SOURCE_PREFIXES = {"reddit": "r/", "user": "u/", "redgifs": "redgifs/"}
 
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
@@ -35,30 +38,16 @@ DISCORD_HEADERS = {
     "Authorization": f"Bot {DISCORD_TOKEN}",
     "User-Agent": "DiscordBot (https://github.com/WojciechGalant1/discord-pull, 1.0)",
 }
-# Nazwa albo ID kanału, na którym użytkownicy serwera dopisują źródła
-CONFIG_CHANNEL = os.environ.get("CONFIG_CHANNEL", "").strip().lstrip("#") or "bot-config"
-POSTABLE_CHANNEL_TYPES = (0, 5)  # Kanał tekstowy i kanał ogłoszeń
-OK_EMOJI, ERROR_EMOJI = "✅", "❌"
-# Co ile minut uruchamia się bot (harmonogram w run.yml albo cron-job.org); służy tylko do szacowania czasów w /when
-RUN_INTERVAL_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES") or 10)
+# Przekazywane przez Cloudflare Worker: co ile minut uruchamia bota oraz źródło wybrane w /post
+RUN_INTERVAL_MINUTES = os.environ.get("RUN_INTERVAL_MINUTES", "").strip()
+ONLY_SOURCE = os.environ.get("ONLY_SOURCE", "").strip()
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
+_REDGIFS_TOKEN = None
 
-def parse_channel_source(token: str):
-    """Rozpoznaje źródło kanału: r/nazwa, redgifs/nazwa albo pełny adres subreddita / niszy RedGifs."""
-    token = token.strip()
-    niche = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", token, re.IGNORECASE)
-    if niche:
-        return "redgifs", niche.group(1).lower()
-    subreddit = re.search(r"reddit\.com/r/([A-Za-z0-9_]+)", token, re.IGNORECASE)
-    if subreddit:
-        return "reddit", subreddit.group(1)
-    short = re.fullmatch(r"(r|redgifs)[/:]([A-Za-z0-9_-]+)/?", token.lstrip("/"), re.IGNORECASE)
-    if short:
-        if short.group(1).lower() == "redgifs":
-            return "redgifs", short.group(2).lower()
-        return "reddit", short.group(2)
-    return None
+
+def source_label(kind: str, name: str) -> str:
+    return SOURCE_PREFIXES[kind] + name
 
 
 def discord_api(method: str, path: str, **kwargs) -> requests.Response:
@@ -76,188 +65,75 @@ def discord_api(method: str, path: str, **kwargs) -> requests.Response:
     return r
 
 
-def find_config_channels() -> list:
-    """Zwraca pary (kanał konfiguracyjny, wszystkie kanały jego serwera)."""
-    if CONFIG_CHANNEL.isdigit():
-        r = discord_api("GET", f"/channels/{CONFIG_CHANNEL}")
-        if r.status_code != 200:
-            print(f"Bot nie widzi kanału konfiguracyjnego o ID {CONFIG_CHANNEL} (HTTP {r.status_code}).")
-            return []
-        guild_ids = [r.json().get("guild_id")]
-    else:
-        r = discord_api("GET", "/users/@me/guilds")
-        if r.status_code != 200:
-            print(f"Nie udało się zalogować bota (HTTP {r.status_code}). Sprawdź sekret DISCORD_TOKEN.")
-            return []
-        guild_ids = [guild["id"] for guild in r.json()]
-
-    found = []
-    for guild_id in guild_ids:
-        r = discord_api("GET", f"/guilds/{guild_id}/channels")
-        if r.status_code != 200:
-            continue
-        guild_channels = r.json()
-        for channel in guild_channels:
-            if channel.get("type") in POSTABLE_CHANNEL_TYPES and CONFIG_CHANNEL in (channel.get("id"), channel.get("name")):
-                found.append((channel, guild_channels))
-    return found
+def read_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        print(f"Ostrzeżenie: nie udało się wczytać {path}: {e}")
+        return default
 
 
-def fetch_config_messages(channel_id: str) -> list | None:
-    """Wiadomości z kanału konfiguracyjnego od najstarszej."""
-    messages, before = [], None
-    for _ in range(10):
-        params = {"limit": 100}
-        if before:
-            params["before"] = before
-        r = discord_api("GET", f"/channels/{channel_id}/messages", params=params)
-        if r.status_code != 200:
-            print(f"Nie można odczytać kanału konfiguracyjnego (HTTP {r.status_code}). Bot potrzebuje uprawnień "
-                  "Wyświetlanie kanału i Czytanie historii wiadomości.")
-            return None
-        batch = r.json()
-        messages.extend(batch)
-        if len(batch) < 100:
-            break
-        before = batch[-1]["id"]
-    return list(reversed(messages))
-
-
-def parse_config_message(content: str, guild_channels: list):
-    """Zwraca (kanały, błędy) z linijek w formacie 'źródło #kanał'."""
-    by_id = {c["id"]: c for c in guild_channels if c.get("type") in POSTABLE_CHANNEL_TYPES}
-    by_name = {c["name"].lower(): c["id"] for c in by_id.values()}
-    channels, errors = [], []
-    for line in content.replace("`", "").splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        if len(parts) != 2:
-            errors.append(f"`{line.strip()[:80]}` – oczekiwano `źródło #kanał`, np. `r/nazwa #kanał`")
-            continue
-        source = parse_channel_source(parts[0])
-        if source is None:
-            errors.append(f"`{parts[0]}` – nieznane źródło (użyj `r/nazwa` albo `redgifs/nazwa`)")
-            continue
-        mention = re.fullmatch(r"<#(\d+)>|(\d+)", parts[1])
-        channel_id = (mention.group(1) or mention.group(2)) if mention else by_name.get(parts[1].lstrip("#").lower())
-        if channel_id not in by_id:
-            errors.append(f"`{parts[1]}` – nie ma takiego kanału tekstowego na tym serwerze")
-            continue
-        channels.append((*source, channel_id))
-    return channels, errors
-
-
-def set_status_reaction(channel_id: str, message: dict, ok: bool) -> bool:
-    """Ustawia ✅ albo ❌ pod wiadomością; zwraca True, jeśli reakcja się zmieniła."""
-    wanted, other = (OK_EMOJI, ERROR_EMOJI) if ok else (ERROR_EMOJI, OK_EMOJI)
-    mine = {r["emoji"].get("name") for r in message.get("reactions", []) if r.get("me")}
-    base = f"/channels/{channel_id}/messages/{message['id']}/reactions"
-    if other in mine:
-        discord_api("DELETE", f"{base}/{quote(other)}/@me")
-    if wanted in mine:
-        return False
-    discord_api("PUT", f"{base}/{quote(wanted)}/@me")
-    return True
-
-
-def reply_to(channel_id: str, message_id: str, text: str):
-    discord_api("POST", f"/channels/{channel_id}/messages", json={
-        "content": text[:2000],
-        "message_reference": {"message_id": message_id, "fail_if_not_exists": False},
-        "allowed_mentions": {"parse": [], "replied_user": False},
-    })
-
-
-def load_channels() -> list:
-    configs = find_config_channels()
-    if not configs:
-        print(f"Nie znaleziono kanału #{CONFIG_CHANNEL}. Utwórz go na serwerze i daj botowi do niego dostęp.")
+def load_sources() -> list:
+    """Lista źródeł zapisywana przez komendy /add i /remove (Cloudflare Worker)."""
+    data = read_json(SOURCES_FILE, {})
+    owner = data.get("repository")
+    if REPOSITORY and owner and owner != REPOSITORY:
+        print("Lista źródeł pochodzi z innego repozytorium (kopia z szablonu). Dodaj własne źródła komendą /add.")
         return []
-
-    channels = []
-    for config_channel, guild_channels in configs:
-        messages = fetch_config_messages(config_channel["id"])
-        if messages is None:
+    sources = []
+    for item in data.get("sources", []):
+        if not isinstance(item, dict) or item.get("type") not in SOURCE_PREFIXES:
             continue
-        user_messages = [m for m in messages if not m["author"].get("bot") and m.get("type") in (0, 19)]
-        if user_messages and not any(m.get("content") for m in user_messages):
-            print("Bot widzi wiadomości na kanale konfiguracyjnym jako puste. Włącz Message Content Intent "
-                  "w Discord Developer Portal (Bot → Privileged Gateway Intents).")
-            continue
-        for message in user_messages:
-            if not message.get("content"):
-                continue
-            found, errors = parse_config_message(message["content"], guild_channels)
-            if set_status_reaction(config_channel["id"], message, not errors) and errors:
-                reply_to(config_channel["id"], message["id"], "Pominięto:\n" + "\n".join(errors))
-            for channel in found:
-                if channel not in channels:
-                    channels.append(channel)
-    return channels
+        source = (item["type"], str(item.get("name") or ""), str(item.get("channel_id") or ""))
+        if all(source) and source not in sources:
+            sources.append(source)
+    return sources
 
 
-def save_schedule(channels: list, next_index: int):
-    """Plik, z którego komenda /when (Cloudflare Worker) wylicza czas następnej wysyłki każdego źródła."""
+def save_schedule(sources: list, next_index: int):
+    """Plik, z którego komenda /when wylicza czas następnej wysyłki każdego źródła."""
+    previous = read_json(SCHEDULE_FILE, {}).get("interval_minutes")
+    interval = int(RUN_INTERVAL_MINUTES) if RUN_INTERVAL_MINUTES.isdigit() else previous or 10
     schedule = {
         "last_run": int(time.time()),
-        "interval_minutes": RUN_INTERVAL_MINUTES,
+        "interval_minutes": interval,
         "sources": [
             {
-                "source": f"redgifs/{name}" if source == "redgifs" else f"r/{name}",
+                "source": source_label(kind, name),
                 "channel_id": channel_id,
-                "runs_ahead": ((i - next_index) % len(channels)) // SOURCES_PER_RUN,
+                "runs_ahead": ((i - next_index) % len(sources)) // SOURCES_PER_RUN,
             }
-            for i, (source, name, channel_id) in enumerate(channels)
+            for i, (kind, name, channel_id) in enumerate(sources)
         ],
     }
     with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
         json.dump(schedule, f)
 
 
-_REDGIFS_TOKEN = None
-
-
 def load_posted_history():
-    if not os.path.exists(STATE_FILE):
-        return [], set()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            items = list(dict.fromkeys(json.load(f)))
-        return items, set(items)
-    except Exception as e:
-        print(f"Ostrzeżenie: nie udało się wczytać {STATE_FILE}: {e}")
-        return [], set()
+    items = list(dict.fromkeys(read_json(STATE_FILE, [])))
+    return items, set(items)
 
 
 def save_posted_history(history_list):
-    trimmed = history_list[-MAX_HISTORY:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(trimmed, f)
+        json.dump(history_list[-MAX_HISTORY:], f)
 
 
 def state_is_from_other_repo() -> bool:
     """Stan skopiowany razem z szablonem należy do innego repozytorium i nie może blokować wysyłki."""
-    if not REPOSITORY or not os.path.exists(ROTATION_FILE):
+    if not REPOSITORY:
         return False
-    try:
-        with open(ROTATION_FILE, "r", encoding="utf-8") as f:
-            owner = json.load(f).get("repository")
-    except Exception:
-        return False
+    owner = read_json(ROTATION_FILE, {}).get("repository")
     return bool(owner) and owner != REPOSITORY
 
 
 def load_rotation_index():
-    if not os.path.exists(ROTATION_FILE):
-        return 0
-    try:
-        with open(ROTATION_FILE, "r", encoding="utf-8") as f:
-            value = json.load(f).get("next_index", 0)
-        return value if isinstance(value, int) and value >= 0 else 0
-    except Exception as e:
-        print(f"Ostrzeżenie: nie udało się wczytać {ROTATION_FILE}: {e}")
-        return 0
+    value = read_json(ROTATION_FILE, {}).get("next_index", 0)
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def save_rotation_index(index):
@@ -268,67 +144,50 @@ def save_rotation_index(index):
         json.dump(state, f)
 
 
-def fetch_via_arctic_shift(sub_name: str, mode: str = "top_day", before_days: int | None = None):
+def arctic_shift_search(params: dict, label: str) -> list | None:
     """Reddit blokuje adresy IP GitHub Actions, więc posty są pobierane z publicznego archiwum Arctic Shift."""
-    if mode == "top_day":
-        seen_posts = {}
-        params = {
-            "subreddit": sub_name,
-            "after": "24h",
-            "sort": "desc",
-            "limit": 100,
-        }
-        # Pobierz posty z ostatnich 24h (maks. 5 stron po 100) i posortuj malejąco po score (odpowiednik top/?t=day)
-        for page in range(5):
-            res = requests.get(ARCTIC_SHIFT_URL, params=params, timeout=20)
-            if res.status_code != 200:
-                if page == 0:
-                    print(f"Błąd Arctic Shift HTTP {res.status_code} dla r/{sub_name}")
-                    return None
-                break
-
-            batch = [p for p in res.json().get("data", []) if isinstance(p, dict) and p.get("id")]
-            for post in batch:
-                seen_posts[post["id"]] = post
-
-            if len(batch) < 100 or not batch[-1].get("created_utc"):
-                break
-            params["before"] = batch[-1]["created_utc"]
-
-        return sorted(
-            seen_posts.values(),
-            key=lambda p: (p.get("score") or 0, p.get("created_utc") or 0),
-            reverse=True,
-        )
-
-    params = {
-        "subreddit": sub_name,
-        "sort": "desc",
-        "limit": 100,
-    }
-    if before_days is not None:
-        params["before"] = f"{before_days}d"
-
-    res = requests.get(ARCTIC_SHIFT_URL, params=params, timeout=20)
-    if res.status_code != 200:
-        print(f"Błąd Arctic Shift HTTP {res.status_code} dla r/{sub_name}")
-        return None
-
-    data = res.json().get("data", [])
-    return [post for post in data if isinstance(post, dict)]
+    for attempt in range(2):
+        res = requests.get(ARCTIC_SHIFT_URL, params=params, timeout=30)
+        # 422 to zwykle chwilowy limit czasu po stronie archiwum ("Timeout. Maybe slow down a bit")
+        if res.status_code == 422 and attempt == 0:
+            time.sleep(3)
+            continue
+        if res.status_code != 200:
+            print(f"Błąd Arctic Shift HTTP {res.status_code} dla {label}")
+            return None
+        return [p for p in res.json().get("data", []) if isinstance(p, dict) and p.get("id")]
+    return None
 
 
 def fetch_top_day_posts(sub_name: str):
-    return fetch_via_arctic_shift(sub_name, mode="top_day")
+    """Posty z ostatnich 24h posortowane po score (odpowiednik top/?t=day); Arctic Shift nie sortuje po score."""
+    seen_posts = {}
+    params = {"subreddit": sub_name, "after": "24h", "sort": "desc", "limit": 100}
+    for page in range(5):
+        batch = arctic_shift_search(params, f"r/{sub_name}")
+        if batch is None:
+            if page == 0:
+                return None
+            break
+        for post in batch:
+            seen_posts[post["id"]] = post
+        if len(batch) < 100 or not batch[-1].get("created_utc"):
+            break
+        params["before"] = batch[-1]["created_utc"]
+
+    return sorted(
+        seen_posts.values(),
+        key=lambda p: (p.get("score") or 0, p.get("created_utc") or 0),
+        reverse=True,
+    )
 
 
 def fetch_older_posts(sub_name: str, posted_ids: set):
     # Najpierw sprawdź starsze posty sprzed >2 dni, a jeśli wszystkie były wysłane — losowe okno z ostatniego roku
     for before_days in (2, random.randint(14, 300)):
-        posts = fetch_via_arctic_shift(sub_name, mode="old", before_days=before_days)
-        if not posts:
-            continue
-        unseen = [p for p in posts if p.get("id") not in posted_ids and is_valid_media_post(p)]
+        params = {"subreddit": sub_name, "sort": "desc", "limit": 100, "before": f"{before_days}d"}
+        posts = arctic_shift_search(params, f"r/{sub_name}") or []
+        unseen = [p for p in posts if is_valid_media_post(p) and not is_posted(p, posted_ids)]
         if unseen:
             return unseen
     return []
@@ -339,6 +198,48 @@ def unwrap_post_source(post_data: dict) -> dict:
     if isinstance(crossposts, list) and crossposts and isinstance(crossposts[0], dict):
         return crossposts[0]
     return post_data
+
+
+def post_url(source: dict) -> str:
+    return html.unescape((source.get("url_overridden_by_dest") or source.get("url") or "").strip())
+
+
+def redgifs_id_from_url(url: str) -> str:
+    match = re.search(r"redgifs\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)", url, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return urlparse(url).path.rstrip("/").split("/")[-1].split(".")[0].lower()
+
+
+def post_keys(post_data: dict) -> list[str]:
+    """Klucze tego samego materiału: ID posta, ID oryginału crossposta i adres mediów (ten sam plik w kilku subredditach)."""
+    keys = [post_data["id"]]
+    parent = post_data.get("crosspost_parent") or ""
+    if parent.startswith("t3_"):
+        keys.append(parent[3:])
+    source = unwrap_post_source(post_data)
+    if source.get("id"):
+        keys.append(source["id"])
+
+    url = post_url(source)
+    host = urlparse(url).netloc.lower()
+    if "redgifs.com" in host:
+        # Ten sam prefiks co w niszach RedGifs, więc film z Reddita nie wróci też z niszy
+        keys.append(f"redgifs:{redgifs_id_from_url(url)}")
+    elif host in ("i.redd.it", "i.imgur.com"):
+        keys.append(f"url:{host}{urlparse(url).path}")
+    return list(dict.fromkeys(keys))
+
+
+def is_posted(post_data: dict, posted_ids: set) -> bool:
+    return any(key in posted_ids for key in post_keys(post_data))
+
+
+def mark_posted(keys: list[str], posted_ids: set, posted_history: list):
+    for key in keys:
+        if key not in posted_ids:
+            posted_ids.add(key)
+            posted_history.append(key)
 
 
 def is_valid_media_post(post_data: dict) -> bool:
@@ -355,7 +256,7 @@ def is_valid_media_post(post_data: dict) -> bool:
     if source.get("removed_by_category") or source.get("is_self"):
         return False
 
-    url = (source.get("url_overridden_by_dest") or source.get("url") or "").strip()
+    url = post_url(source)
     if not url or "/removed_by_moderator/" in url:
         return False
 
@@ -367,8 +268,7 @@ def is_valid_media_post(post_data: dict) -> bool:
 
     # Odrzuć zwykłe linki do komentarzy na Reddicie bez obrazu/wideo
     parsed = urlparse(url)
-    path_lower = parsed.path.lower()
-    if "reddit.com" in parsed.netloc.lower() and "/comments/" in path_lower:
+    if "reddit.com" in parsed.netloc.lower() and "/comments/" in parsed.path.lower():
         return False
 
     return True
@@ -530,8 +430,9 @@ def post_to_discord(channel_id: str, content: str, files: list[tuple] | None = N
 
     if r.status_code == 200:
         return True
-    if r.status_code == 403:
-        print(f"Bot nie ma uprawnień do pisania na kanale {channel_id} (Wysyłanie wiadomości, Załączanie plików).")
+    if r.status_code in (403, 404):
+        print(f"Bot nie może pisać na kanale {channel_id} (HTTP {r.status_code}): sprawdź, czy kanał istnieje "
+              "i czy bot ma uprawnienia Wysyłanie wiadomości i Załączanie plików.")
     else:
         print(f"Błąd wysyłki na Discorda: HTTP {r.status_code} - {r.text[:200]}")
     return False
@@ -598,7 +499,7 @@ def send_post(channel_id: str, post_data: dict) -> bool:
     header = message_header(title)
 
     source = unwrap_post_source(post_data)
-    raw_url = html.unescape((source.get("url_overridden_by_dest") or source.get("url") or "").strip())
+    raw_url = post_url(source)
     path_lower = urlparse(raw_url).path.lower()
 
     post_id = post_data.get("id", "post")
@@ -619,13 +520,7 @@ def send_post(channel_id: str, post_data: dict) -> bool:
 
     # 3. RedGifs -> spróbuj wrzucić natywny plik .mp4 (z dźwiękiem), fallback do czystego linku watch
     if "redgifs.com/" in raw_url.lower():
-        match = re.search(r"redgifs\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)", raw_url, re.IGNORECASE)
-        gif_id = (
-            match.group(1).lower()
-            if match
-            else urlparse(raw_url).path.rstrip("/").split("/")[-1].split(".")[0].lower()
-        )
-        return send_redgifs(channel_id, gif_id, header)
+        return send_redgifs(channel_id, redgifs_id_from_url(raw_url), header)
 
     # 4. Natywne wideo Reddita (v.redd.it)
     if source.get("is_video") or "v.redd.it/" in raw_url.lower():
@@ -638,40 +533,68 @@ def send_post(channel_id: str, post_data: dict) -> bool:
     return post_with_links(channel_id, header, [raw_url])
 
 
-def mark_posted(post_id: str, posted_ids: set, posted_history: list):
-    posted_ids.add(post_id)
-    posted_history.append(post_id)
+def send_reddit_posts(channel_id: str, posts: list, posted_ids: set, posted_history: list, label: str, kind: str) -> int:
+    sent = 0
+    for post in posts:
+        # Ten sam materiał mógł już pójść w tym przebiegu z innego posta (crosspost, ten sam plik)
+        if is_posted(post, posted_ids):
+            continue
+        if send_post(channel_id, post):
+            mark_posted(post_keys(post), posted_ids, posted_history)
+            sent += 1
+            print(f"Wysłano {kind} ({post['id']}, score={post.get('score', '?')}) z {label}")
+            time.sleep(1.5)
+    return sent
 
 
 def process_subreddit(sub_name: str, channel_id: str, posted_ids: set, posted_history: list):
+    label = f"r/{sub_name}"
     top_day_posts = fetch_top_day_posts(sub_name)
     if top_day_posts is None:
-        print(f"Nie udało się pobrać postów dla r/{sub_name}")
+        print(f"Nie udało się pobrać postów dla {label}")
         return
 
     # Sprawdź TOP_DAY_LIMIT najlepszych postów z dzisiaj (top/?t=day) zawierających media
     media_top_day = [p for p in top_day_posts if is_valid_media_post(p)][:TOP_DAY_LIMIT]
-    sent_in_this_run = 0
-
-    for post in reversed(media_top_day):
-        post_id = post["id"]
-        if post_id not in posted_ids and send_post(channel_id, post):
-            mark_posted(post_id, posted_ids, posted_history)
-            sent_in_this_run += 1
-            print(f"Wysłano nowy post z TOP dnia ({post_id}, score={post.get('score', '?')}) z r/{sub_name}")
-            time.sleep(1.5)
+    if send_reddit_posts(channel_id, list(reversed(media_top_day)), posted_ids, posted_history, label, "post z TOP dnia"):
+        return
 
     # Fallback: jeśli w TOP dnia nie pojawił się żaden nowy (niewysłany) post, wyślij 1 starszy post z roku
-    if sent_in_this_run == 0:
-        time.sleep(1)
-        unseen_old = fetch_older_posts(sub_name, posted_ids)
-        if not unseen_old:
-            print(f"Brak nowych i starszych postów dla r/{sub_name} (sprawdź nazwę subreddita)")
+    time.sleep(1)
+    unseen_old = fetch_older_posts(sub_name, posted_ids)
+    if not unseen_old:
+        print(f"Brak nowych i starszych postów dla {label} (sprawdź nazwę subreddita)")
+        return
+    send_reddit_posts(channel_id, [random.choice(unseen_old)], posted_ids, posted_history, label, "starszy post (fallback)")
+
+
+def process_user(author: str, channel_id: str, posted_ids: set, posted_history: list):
+    label = f"u/{author}"
+    params = {"author": author, "sort": "desc", "limit": 100}
+    posts = arctic_shift_search(params, label)
+    if posts is None:
+        print(f"Nie udało się pobrać postów użytkownika {label}")
+        return
+
+    # Najpierw posty z ostatnich 24h, od najstarszego
+    cutoff = time.time() - 24 * 3600
+    fresh = [p for p in posts if (p.get("created_utc") or 0) >= cutoff and is_valid_media_post(p)][:TOP_DAY_LIMIT]
+    if send_reddit_posts(channel_id, list(reversed(fresh)), posted_ids, posted_history, label, "nowy post"):
+        return
+
+    # Fallback: najnowszy jeszcze niewysłany post, szukając coraz dalej w historii użytkownika
+    for _ in range(USER_HISTORY_PAGES):
+        unseen = [p for p in posts if is_valid_media_post(p) and not is_posted(p, posted_ids)]
+        if unseen:
+            send_reddit_posts(channel_id, unseen[:1], posted_ids, posted_history, label, "starszy post (fallback)")
             return
-        chosen_post = random.choice(unseen_old)
-        if send_post(channel_id, chosen_post):
-            mark_posted(chosen_post["id"], posted_ids, posted_history)
-            print(f"Wysłano starszy post (fallback: {chosen_post['id']}) z r/{sub_name}")
+        if len(posts) < 100 or not posts[-1].get("created_utc"):
+            break
+        params["before"] = posts[-1]["created_utc"]
+        posts = arctic_shift_search(params, label)
+        if not posts:
+            break
+    print(f"Brak niewysłanych postów z mediami dla {label} (sprawdź nazwę użytkownika)")
 
 
 def process_redgifs_niche(niche: str, channel_id: str, posted_ids: set, posted_history: list):
@@ -700,45 +623,59 @@ def process_redgifs_niche(niche: str, channel_id: str, posted_ids: set, posted_h
     for gif in to_send:
         header = message_header(html.unescape((gif.get("description") or "").strip())[:250])
         if send_redgifs(channel_id, gif["id"], header, gif.get("urls")):
-            mark_posted(f"redgifs:{gif['id']}", posted_ids, posted_history)
+            mark_posted([f"redgifs:{gif['id']}"], posted_ids, posted_history)
             print(f"Wysłano film {gif['id']} z niszy RedGifs {niche}")
             time.sleep(1.5)
+
+
+PROCESSORS = {"reddit": process_subreddit, "user": process_user, "redgifs": process_redgifs_niche}
+
+
+def process_source(source: tuple, posted_ids: set, posted_history: list):
+    kind, name, channel_id = source
+    try:
+        PROCESSORS[kind](name, channel_id, posted_ids, posted_history)
+    except Exception as e:
+        print(f"Błąd dla {source_label(kind, name)}: {e}")
 
 
 def main():
     if not DISCORD_TOKEN:
         raise RuntimeError("Brak sekretu DISCORD_TOKEN z tokenem bota Discorda.")
-    channels = load_channels()
-    if not channels:
-        print(f"Brak źródeł. Napisz na kanale #{CONFIG_CHANNEL} np.: r/NazwaSubreddita #kanał")
+    sources = load_sources()
+    if not sources:
+        print("Brak źródeł. Dodaj je na Discordzie komendą /add, np. /add source:r/NazwaSubreddita")
         return
 
-    if state_is_from_other_repo():
+    fresh_state = state_is_from_other_repo()
+    if fresh_state:
         print("Pliki stanu pochodzą z innego repozytorium (kopia z szablonu). Zaczynam od zera.")
         posted_history, posted_ids = [], set()
-        index = 0
     else:
         posted_history, posted_ids = load_posted_history()
-        index = load_rotation_index() % len(channels)
 
-    for _ in range(min(SOURCES_PER_RUN, len(channels))):
-        source, name, channel_id = channels[index]
-        label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
-        print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
-        try:
-            if source == "redgifs":
-                process_redgifs_niche(name, channel_id, posted_ids, posted_history)
-            else:
-                process_subreddit(name, channel_id, posted_ids, posted_history)
-        except Exception as e:
-            print(f"Błąd dla {label}: {e}")
+    # /post: tylko wybrane źródło, bez przesuwania kolejki
+    if ONLY_SOURCE:
+        chosen = [s for s in sources if source_label(s[0], s[1]).lower() == ONLY_SOURCE.lower()]
+        if not chosen:
+            print(f"Źródła {ONLY_SOURCE} nie ma na liście.")
+        for source in chosen:
+            print(f"Na żądanie (/post): {ONLY_SOURCE} → kanał {source[2]}")
+            process_source(source, posted_ids, posted_history)
+        save_posted_history(posted_history)
+        return
+
+    index = 0 if fresh_state else load_rotation_index() % len(sources)
+    for _ in range(min(SOURCES_PER_RUN, len(sources))):
+        print(f"Kolejka: {source_label(*sources[index][:2])} ({index + 1}/{len(sources)})")
+        process_source(sources[index], posted_ids, posted_history)
 
         # Zapis po każdym źródle, żeby przerwany przebieg nie zgubił tego, co już wysłano
-        index = (index + 1) % len(channels)
+        index = (index + 1) % len(sources)
         save_posted_history(posted_history)
         save_rotation_index(index)
 
-    save_schedule(channels, index)
+    save_schedule(sources, index)
 
 
 if __name__ == "__main__":

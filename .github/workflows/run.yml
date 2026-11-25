@@ -1,9 +1,16 @@
 name: Reddit to Discord Feed
+run-name: ${{ inputs.source && format('/post {0}', inputs.source) || 'Feed' }}
 
+# Uruchamiany przez Cloudflare Worker (harmonogram i komenda /post) albo ręcznie z zakładki Actions
 on:
-  schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
+    inputs:
+      interval_minutes:
+        description: 'Co ile minut Worker uruchamia bota (do szacowania czasów w /when)'
+        required: false
+      source:
+        description: 'Tylko to źródło, np. r/NazwaSubreddita (puste = kolejka)'
+        required: false
 
 concurrency:
   group: reddit-to-discord-feed
@@ -28,8 +35,8 @@ jobs:
         timeout-minutes: 8
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          CONFIG_CHANNEL: ${{ vars.CONFIG_CHANNEL }}
-          RUN_INTERVAL_MINUTES: ${{ vars.RUN_INTERVAL_MINUTES }}
+          RUN_INTERVAL_MINUTES: ${{ inputs.interval_minutes }}
+          ONLY_SOURCE: ${{ inputs.source }}
         run: python bot.py
       - name: Save posted history
         if: ${{ !cancelled() }}
