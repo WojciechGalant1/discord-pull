@@ -5,7 +5,7 @@ import os
 import random
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -13,7 +13,7 @@ STATE_FILE = "posted.json"
 ROTATION_FILE = "rotation.json"
 MAX_HISTORY = 3000
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
-MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit pod darmowy webhook Discorda (10 MiB)
+MAX_UPLOAD_BYTES = int(9.5 * 1024 * 1024)  # Bezpieczny limit załącznika na serwerze bez boostów (10 MiB)
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 REDGIFS_TOP_MAX_PAGE = 10  # Z ilu pierwszych stron (po 40 filmów) najpopularniejszych losować fallback
 MAX_FILES_PER_MESSAGE = 10  # Limit załączników w jednej wiadomości Discorda
@@ -27,7 +27,16 @@ MEDIA_TYPES = {
 }
 ROLE_ID = "1572719490435653813"  # Rola oznaczana w każdym poście; pusty tekst wyłącza oznaczanie
 
-WEBHOOK_PATTERN = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+DISCORD_HEADERS = {
+    "Authorization": f"Bot {DISCORD_TOKEN}",
+    "User-Agent": "DiscordBot (https://github.com/WojciechGalant1/discord-pull, 1.0)",
+}
+# Nazwa albo ID kanału, na którym użytkownicy serwera dopisują źródła
+CONFIG_CHANNEL = os.environ.get("CONFIG_CHANNEL", "").strip().lstrip("#") or "bot-config"
+POSTABLE_CHANNEL_TYPES = (0, 5)  # Kanał tekstowy i kanał ogłoszeń
+OK_EMOJI, ERROR_EMOJI = "✅", "❌"
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
 
@@ -48,78 +57,141 @@ def parse_channel_source(token: str):
     return None
 
 
-def load_line_channels(name: str) -> list:
-    raw = os.environ.get(name, "").strip()
-    channels = []
-    for line_no, line in enumerate(raw.splitlines(), start=1):
-        line = line.strip()
-        if not line or line.startswith("#"):
+def discord_api(method: str, path: str, **kwargs) -> requests.Response:
+    kwargs.setdefault("timeout", 30)
+    for attempt in range(3):
+        r = requests.request(method, DISCORD_API + path, headers=DISCORD_HEADERS, **kwargs)
+        if r.status_code != 429 or attempt == 2:
+            return r
+        retry_after = 2.0
+        try:
+            retry_after = float(r.json().get("retry_after", 2.0))
+        except Exception:
+            pass
+        time.sleep(retry_after + 0.5)
+    return r
+
+
+def find_config_channels() -> list:
+    """Zwraca pary (kanał konfiguracyjny, wszystkie kanały jego serwera)."""
+    if CONFIG_CHANNEL.isdigit():
+        r = discord_api("GET", f"/channels/{CONFIG_CHANNEL}")
+        if r.status_code != 200:
+            print(f"Bot nie widzi kanału konfiguracyjnego o ID {CONFIG_CHANNEL} (HTTP {r.status_code}).")
+            return []
+        guild_ids = [r.json().get("guild_id")]
+    else:
+        r = discord_api("GET", "/users/@me/guilds")
+        if r.status_code != 200:
+            print(f"Nie udało się zalogować bota (HTTP {r.status_code}). Sprawdź sekret DISCORD_TOKEN.")
+            return []
+        guild_ids = [guild["id"] for guild in r.json()]
+
+    found = []
+    for guild_id in guild_ids:
+        r = discord_api("GET", f"/guilds/{guild_id}/channels")
+        if r.status_code != 200:
             continue
-        match = re.fullmatch(r"(\S+?)\s*=?\s*(https?://\S+)", line)
-        if not match:
-            print(f"Błąd w sekrecie {name}, linijka {line_no}: oczekiwano 'r/nazwa ADRES_WEBHOOKA' albo 'redgifs/nazwa ADRES_WEBHOOKA'. Pomijam.")
+        guild_channels = r.json()
+        for channel in guild_channels:
+            if channel.get("type") in POSTABLE_CHANNEL_TYPES and CONFIG_CHANNEL in (channel.get("id"), channel.get("name")):
+                found.append((channel, guild_channels))
+    return found
+
+
+def fetch_config_messages(channel_id: str) -> list | None:
+    """Wiadomości z kanału konfiguracyjnego od najstarszej."""
+    messages, before = [], None
+    for _ in range(10):
+        params = {"limit": 100}
+        if before:
+            params["before"] = before
+        r = discord_api("GET", f"/channels/{channel_id}/messages", params=params)
+        if r.status_code != 200:
+            print(f"Nie można odczytać kanału konfiguracyjnego (HTTP {r.status_code}). Bot potrzebuje uprawnień "
+                  "Wyświetlanie kanału i Czytanie historii wiadomości.")
+            return None
+        batch = r.json()
+        messages.extend(batch)
+        if len(batch) < 100:
+            break
+        before = batch[-1]["id"]
+    return list(reversed(messages))
+
+
+def parse_config_message(content: str, guild_channels: list):
+    """Zwraca (kanały, błędy) z linijek w formacie 'źródło #kanał'."""
+    by_id = {c["id"]: c for c in guild_channels if c.get("type") in POSTABLE_CHANNEL_TYPES}
+    by_name = {c["name"].lower(): c["id"] for c in by_id.values()}
+    channels, errors = [], []
+    for line in content.replace("`", "").splitlines():
+        parts = line.split()
+        if not parts:
             continue
-        source = parse_channel_source(match.group(1))
+        if len(parts) != 2:
+            errors.append(f"`{line.strip()[:80]}` – oczekiwano `źródło #kanał`, np. `r/nazwa #kanał`")
+            continue
+        source = parse_channel_source(parts[0])
         if source is None:
-            print(f"Błąd w sekrecie {name}, linijka {line_no}: nie rozpoznano źródła '{match.group(1)}' (użyj r/nazwa albo redgifs/nazwa). Pomijam.")
+            errors.append(f"`{parts[0]}` – nieznane źródło (użyj `r/nazwa` albo `redgifs/nazwa`)")
             continue
-        channels.append((*source, match.group(2)))
-    return channels
+        mention = re.fullmatch(r"<#(\d+)>|(\d+)", parts[1])
+        channel_id = (mention.group(1) or mention.group(2)) if mention else by_name.get(parts[1].lstrip("#").lower())
+        if channel_id not in by_id:
+            errors.append(f"`{parts[1]}` – nie ma takiego kanału tekstowego na tym serwerze")
+            continue
+        channels.append((*source, channel_id))
+    return channels, errors
 
 
-def load_json_channels(name: str, source: str, parse) -> list:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return []
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Błąd: sekret {name} nie jest poprawnym JSON-em ({e}). Pomijam go.")
-        return []
-    if not isinstance(value, dict):
-        print(f"Błąd: sekret {name} musi być obiektem JSON {{\"nazwa\": \"webhook\"}}. Pomijam go.")
-        return []
-    return [(source, parse(key), webhook_url) for key, webhook_url in value.items()]
+def set_status_reaction(channel_id: str, message: dict, ok: bool) -> bool:
+    """Ustawia ✅ albo ❌ pod wiadomością; zwraca True, jeśli reakcja się zmieniła."""
+    wanted, other = (OK_EMOJI, ERROR_EMOJI) if ok else (ERROR_EMOJI, OK_EMOJI)
+    mine = {r["emoji"].get("name") for r in message.get("reactions", []) if r.get("me")}
+    base = f"/channels/{channel_id}/messages/{message['id']}/reactions"
+    if other in mine:
+        discord_api("DELETE", f"{base}/{quote(other)}/@me")
+    if wanted in mine:
+        return False
+    discord_api("PUT", f"{base}/{quote(wanted)}/@me")
+    return True
 
 
-def parse_subreddit(raw_key: str) -> str:
-    return raw_key.strip().removeprefix("/r/").removeprefix("r/").strip("/")
-
-
-def parse_redgifs_niche(raw_key: str) -> str:
-    key = raw_key.strip()
-    niche_match = re.search(r"redgifs\.com/niches/([A-Za-z0-9_-]+)", key, re.IGNORECASE)
-    if niche_match:
-        return niche_match.group(1).lower()
-    return key.strip("/").lower()
+def reply_to(channel_id: str, message_id: str, text: str):
+    discord_api("POST", f"/channels/{channel_id}/messages", json={
+        "content": text[:2000],
+        "message_reference": {"message_id": message_id, "fail_if_not_exists": False},
+        "allowed_mentions": {"parse": [], "replied_user": False},
+    })
 
 
 def load_channels() -> list:
-    configured = (
-        load_line_channels("CHANNELS")
-        + load_json_channels("DISCORD_CHANNELS", "reddit", parse_subreddit)
-        + load_json_channels("REDGIFS_CHANNELS", "redgifs", parse_redgifs_niche)
-    )
+    configs = find_config_channels()
+    if not configs:
+        print(f"Nie znaleziono kanału #{CONFIG_CHANNEL}. Utwórz go na serwerze i daj botowi do niego dostęp.")
+        return []
+
     channels = []
-    for source, name, webhook_url in configured:
-        webhook_url = str(webhook_url or "").strip()
-        if not name or "TUTAJ_LINK" in webhook_url:
+    for config_channel, guild_channels in configs:
+        messages = fetch_config_messages(config_channel["id"])
+        if messages is None:
             continue
-        if not WEBHOOK_PATTERN.match(webhook_url):
-            print(f"Błąd: kanał {source}/{name} nie ma poprawnego adresu webhooka Discorda. Pomijam go.")
+        user_messages = [m for m in messages if not m["author"].get("bot") and m.get("type") in (0, 19)]
+        if user_messages and not any(m.get("content") for m in user_messages):
+            print("Bot widzi wiadomości na kanale konfiguracyjnym jako puste. Włącz Message Content Intent "
+                  "w Discord Developer Portal (Bot → Privileged Gateway Intents).")
             continue
-        if (source, name, webhook_url) not in channels:
-            channels.append((source, name, webhook_url))
+        for message in user_messages:
+            if not message.get("content"):
+                continue
+            found, errors = parse_config_message(message["content"], guild_channels)
+            if set_status_reaction(config_channel["id"], message, not errors) and errors:
+                reply_to(config_channel["id"], message["id"], "Pominięto:\n" + "\n".join(errors))
+            for channel in found:
+                if channel not in channels:
+                    channels.append(channel)
     return channels
 
-
-CHANNELS = load_channels()
-if not CHANNELS:
-    raise RuntimeError(
-        "Brak skonfigurowanych kanałów. Dodaj sekret CHANNELS, np.:\n"
-        "r/NazwaSubreddita https://discord.com/api/webhooks/...\n"
-        "redgifs/nazwa-niszy https://discord.com/api/webhooks/..."
-    )
 
 _REDGIFS_TOKEN = None
 
@@ -416,37 +488,30 @@ def message_header(title: str) -> str:
     return " ".join(parts)
 
 
-def post_to_discord(webhook_url: str, content: str, files: list[tuple] | None = None) -> bool:
+def post_to_discord(channel_id: str, content: str, files: list[tuple] | None = None) -> bool:
     # Tytuły postów pochodzą od obcych osób, więc pingować wolno wyłącznie skonfigurowaną rolę (bez @everyone itp.)
     payload = {
         "content": content,
         "allowed_mentions": {"parse": [], "roles": [ROLE_ID] if ROLE_ID else []},
     }
-    for attempt in range(3):
-        if files:
-            r = requests.post(
-                webhook_url,
-                data={"payload_json": json.dumps(payload)},
-                files={f"files[{i}]": file for i, file in enumerate(files)},
-                timeout=60,
-            )
-        else:
-            r = requests.post(webhook_url, json=payload, timeout=15)
+    path = f"/channels/{channel_id}/messages"
+    if files:
+        r = discord_api(
+            "POST",
+            path,
+            data={"payload_json": json.dumps(payload)},
+            files={f"files[{i}]": file for i, file in enumerate(files)},
+            timeout=60,
+        )
+    else:
+        r = discord_api("POST", path, json=payload)
 
-        if r.status_code in (200, 204):
-            return True
-
-        if r.status_code == 429 and attempt < 2:
-            retry_after = 2.0
-            try:
-                retry_after = float(r.json().get("retry_after", 2.0))
-            except Exception:
-                pass
-            time.sleep(retry_after + 0.5)
-            continue
-
+    if r.status_code == 200:
+        return True
+    if r.status_code == 403:
+        print(f"Bot nie ma uprawnień do pisania na kanale {channel_id} (Wysyłanie wiadomości, Załączanie plików).")
+    else:
         print(f"Błąd wysyłki na Discorda: HTTP {r.status_code} - {r.text[:200]}")
-        return False
     return False
 
 
@@ -459,15 +524,15 @@ def media_file(url: str, data: bytes, fallback_name: str) -> tuple:
     return name, data, MEDIA_TYPES[ext]
 
 
-def post_with_links(webhook_url: str, header: str, links: list[str]) -> bool:
+def post_with_links(channel_id: str, header: str, links: list[str]) -> bool:
     # Discord ukrywa adres tylko wtedy, gdy wiadomość zawiera sam link, więc tytuł idzie osobno
-    ok = post_to_discord(webhook_url, header) if header else False
+    ok = post_to_discord(channel_id, header) if header else False
     for link in links:
-        ok = post_to_discord(webhook_url, link) or ok
+        ok = post_to_discord(channel_id, link) or ok
     return ok
 
 
-def send_media(webhook_url: str, header: str, urls: list[str], name_prefix: str) -> bool:
+def send_media(channel_id: str, header: str, urls: list[str], name_prefix: str) -> bool:
     """Wysyła media jako załączniki (bez widocznych linków); pliki, których nie da się pobrać, idą jako same linki."""
     attachments, links = [], []
     for i, url in enumerate(urls):
@@ -488,23 +553,23 @@ def send_media(webhook_url: str, header: str, urls: list[str], name_prefix: str)
         batches.append(current)
 
     if not batches:
-        return post_with_links(webhook_url, header, links)
+        return post_with_links(channel_id, header, links)
 
     ok = False
     for idx, batch in enumerate(batches):
-        ok = post_to_discord(webhook_url, header if idx == 0 else "", files=batch) or ok
+        ok = post_to_discord(channel_id, header if idx == 0 else "", files=batch) or ok
         time.sleep(1)
-    return post_with_links(webhook_url, "", links) or ok
+    return post_with_links(channel_id, "", links) or ok
 
 
-def send_redgifs(webhook_url: str, gif_id: str, header: str, urls: dict | None = None) -> bool:
+def send_redgifs(channel_id: str, gif_id: str, header: str, urls: dict | None = None) -> bool:
     video_bytes = resolve_redgifs_mp4(gif_id, urls)
     if video_bytes:
-        return post_to_discord(webhook_url, header, files=[(f"{gif_id}.mp4", video_bytes, "video/mp4")])
-    return post_with_links(webhook_url, header, [f"https://www.redgifs.com/watch/{gif_id}"])
+        return post_to_discord(channel_id, header, files=[(f"{gif_id}.mp4", video_bytes, "video/mp4")])
+    return post_with_links(channel_id, header, [f"https://www.redgifs.com/watch/{gif_id}"])
 
 
-def send_post(webhook_url: str, post_data: dict) -> bool:
+def send_post(channel_id: str, post_data: dict) -> bool:
     title = html.unescape((post_data.get("title") or "").strip())
     if len(title) > 250:
         title = title[:247] + "..."
@@ -521,14 +586,14 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
         gallery_urls = extract_gallery_urls(source)
         if not gallery_urls:
             return False
-        return send_media(webhook_url, header, gallery_urls, post_id)
+        return send_media(channel_id, header, gallery_urls, post_id)
 
     # 2. Bezpośredni obrazek / GIF (i.redd.it, imgur itp.)
     if path_lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
-        return send_media(webhook_url, header, [raw_url], post_id)
+        return send_media(channel_id, header, [raw_url], post_id)
 
     if path_lower.endswith(".gifv"):
-        return send_media(webhook_url, header, [raw_url[:-5] + ".mp4"], post_id)
+        return send_media(channel_id, header, [raw_url[:-5] + ".mp4"], post_id)
 
     # 3. RedGifs -> spróbuj wrzucić natywny plik .mp4 (z dźwiękiem), fallback do czystego linku watch
     if "redgifs.com/" in raw_url.lower():
@@ -538,17 +603,17 @@ def send_post(webhook_url: str, post_data: dict) -> bool:
             if match
             else urlparse(raw_url).path.rstrip("/").split("/")[-1].split(".")[0].lower()
         )
-        return send_redgifs(webhook_url, gif_id, header)
+        return send_redgifs(channel_id, gif_id, header)
 
     # 4. Natywne wideo Reddita (v.redd.it)
     if source.get("is_video") or "v.redd.it/" in raw_url.lower():
         rv = ((source.get("secure_media") or source.get("media") or {}).get("reddit_video")) or {}
         fallback_url = html.unescape(rv.get("fallback_url") or "")
         if fallback_url:
-            return send_media(webhook_url, header, [fallback_url], post_id)
+            return send_media(channel_id, header, [fallback_url], post_id)
 
     # 5. Pozostałe zewnętrzne linki z mediami
-    return post_with_links(webhook_url, header, [raw_url])
+    return post_with_links(channel_id, header, [raw_url])
 
 
 def mark_posted(post_id: str, posted_ids: set, posted_history: list):
@@ -556,7 +621,7 @@ def mark_posted(post_id: str, posted_ids: set, posted_history: list):
     posted_history.append(post_id)
 
 
-def process_subreddit(sub_name: str, webhook_url: str, posted_ids: set, posted_history: list):
+def process_subreddit(sub_name: str, channel_id: str, posted_ids: set, posted_history: list):
     top_day_posts = fetch_top_day_posts(sub_name)
     if top_day_posts is None:
         print(f"Nie udało się pobrać postów dla r/{sub_name}")
@@ -568,7 +633,7 @@ def process_subreddit(sub_name: str, webhook_url: str, posted_ids: set, posted_h
 
     for post in reversed(media_top_day):
         post_id = post["id"]
-        if post_id not in posted_ids and send_post(webhook_url, post):
+        if post_id not in posted_ids and send_post(channel_id, post):
             mark_posted(post_id, posted_ids, posted_history)
             sent_in_this_run += 1
             print(f"Wysłano nowy post z TOP dnia ({post_id}, score={post.get('score', '?')}) z r/{sub_name}")
@@ -582,12 +647,12 @@ def process_subreddit(sub_name: str, webhook_url: str, posted_ids: set, posted_h
             print(f"Brak nowych i starszych postów dla r/{sub_name} (sprawdź nazwę subreddita)")
             return
         chosen_post = random.choice(unseen_old)
-        if send_post(webhook_url, chosen_post):
+        if send_post(channel_id, chosen_post):
             mark_posted(chosen_post["id"], posted_ids, posted_history)
             print(f"Wysłano starszy post (fallback: {chosen_post['id']}) z r/{sub_name}")
 
 
-def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_history: list):
+def process_redgifs_niche(niche: str, channel_id: str, posted_ids: set, posted_history: list):
     gifs, _ = fetch_redgifs_niche(niche)
     if gifs is None:
         print(f"Nie udało się pobrać filmów z niszy RedGifs {niche}")
@@ -612,14 +677,19 @@ def process_redgifs_niche(niche: str, webhook_url: str, posted_ids: set, posted_
 
     for gif in to_send:
         header = message_header(html.unescape((gif.get("description") or "").strip())[:250])
-        if send_redgifs(webhook_url, gif["id"], header, gif.get("urls")):
+        if send_redgifs(channel_id, gif["id"], header, gif.get("urls")):
             mark_posted(f"redgifs:{gif['id']}", posted_ids, posted_history)
             print(f"Wysłano film {gif['id']} z niszy RedGifs {niche}")
             time.sleep(1.5)
 
 
 def main():
-    channels = CHANNELS
+    if not DISCORD_TOKEN:
+        raise RuntimeError("Brak sekretu DISCORD_TOKEN z tokenem bota Discorda.")
+    channels = load_channels()
+    if not channels:
+        print(f"Brak źródeł. Napisz na kanale #{CONFIG_CHANNEL} np.: r/NazwaSubreddita #kanał")
+        return
 
     if state_is_from_other_repo():
         print("Pliki stanu pochodzą z innego repozytorium (kopia z szablonu). Zaczynam od zera.")
@@ -628,15 +698,15 @@ def main():
     else:
         posted_history, posted_ids = load_posted_history()
         index = load_rotation_index() % len(channels)
-    source, name, webhook_url = channels[index]
+    source, name, channel_id = channels[index]
     label = f"RedGifs/{name}" if source == "redgifs" else f"r/{name}"
     print(f"Kolejka: {label} ({index + 1}/{len(channels)})")
 
     try:
         if source == "redgifs":
-            process_redgifs_niche(name, webhook_url, posted_ids, posted_history)
+            process_redgifs_niche(name, channel_id, posted_ids, posted_history)
         else:
-            process_subreddit(name, webhook_url, posted_ids, posted_history)
+            process_subreddit(name, channel_id, posted_ids, posted_history)
     except Exception as e:
         print(f"Błąd dla {label}: {e}")
 

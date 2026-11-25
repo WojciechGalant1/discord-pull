@@ -1,6 +1,6 @@
 # discord-pull
 
-Bot wysyła filmy i obrazki z wybranych subredditów oraz nisz RedGifs na kanały Discorda przez webhooki. Działa w GitHub Actions, bez własnego serwera.
+Bot wysyła filmy i obrazki z wybranych subredditów oraz nisz RedGifs na kanały Discorda. Działa w GitHub Actions, bez własnego serwera, a listę źródeł użytkownicy serwera ustawiają wiadomościami na kanale `#bot-config`.
 
 Każde uruchomienie obsługuje jeden kanał, a następne bierze kolejny, w pętli. Z subredditów brane są najlepsze posty dnia (`top/?t=day`), z RedGifs filmy z niszy w kolejności `?order=hot`. Gdy nie ma nic nowego, bot wysyła jeden starszy, jeszcze niewysłany post. Wysłane ID są zapisywane w `posted.json`, więc nic się nie powtarza.
 
@@ -11,45 +11,47 @@ Każde uruchomienie obsługuje jeden kanał, a następne bierze kolejny, w pętl
 1. Zaloguj się na [github.com](https://github.com), otwórz stronę tego repozytorium i kliknij zielony przycisk **Use this template → Create a new repository**. Dostaniesz własną kopię bez historii commitów. Historia wysłanych postów z oryginału zostanie zignorowana przy pierwszym uruchomieniu, więc Twój bot wyśle wszystko od nowa.
 2. Wybierz widoczność repozytorium:
    - **Private** – nikt nie widzi kodu ani historii wysłanych postów. GitHub daje wtedy 2000 darmowych minut Actions miesięcznie, a każde uruchomienie liczy się jako co najmniej 1 minuta. Częstotliwość ustaw tak, żeby się w tym zmieścić (patrz krok 6).
-   - **Public** – minuty Actions są bez limitu. Sekrety z webhookami nadal pozostają ukryte, ale każdy widzi kod i plik `posted.json`.
+   - **Public** – minuty Actions są bez limitu. Token bota w sekretach nadal pozostaje ukryty, ale każdy widzi kod i plik `posted.json`.
 3. Wejdź w **Settings → Actions → General**:
    - w sekcji **Actions permissions** zaznacz **Allow all actions and reusable workflows**,
    - na dole strony w **Workflow permissions** zaznacz **Read and write permissions** i kliknij **Save**. Bot musi móc zapisywać w repozytorium pliki `posted.json` i `rotation.json`.
 
-### 2. Utwórz webhooki na serwerze Discord
+### 2. Utwórz bota Discorda i dodaj go na serwer
 
-Dla każdego kanału, na który mają trafiać posty:
+1. Wejdź na [Discord Developer Portal](https://discord.com/developers/applications), kliknij **New Application** i nadaj nazwę.
+2. W zakładce **Bot**:
+   - kliknij **Reset Token** i skopiuj token. Działa jak hasło do bota, więc wklej go tylko do sekretu w kroku 4,
+   - w sekcji **Privileged Gateway Intents** włącz **Message Content Intent** i zapisz. Bez tego bot nie przeczyta poleceń z kanału konfiguracyjnego.
+3. Skopiuj **Application ID** z zakładki **General Information** i otwórz w przeglądarce adres (podmień `APPLICATION_ID`):
+   `https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot&permissions=117824`
+   Wybierz serwer i zatwierdź. Bot dostanie uprawnienia: wyświetlanie kanałów, wysyłanie wiadomości, osadzanie linków, załączanie plików, czytanie historii i dodawanie reakcji.
+4. Na kanałach z treściami dla dorosłych włącz w ustawieniach kanału **Kanał z ograniczeniem wiekowym**.
+5. Żeby bot mógł oznaczać rolę z `ROLE_ID` w `bot.py`, w **Ustawieniach serwera → Role** włącz przy tej roli **Pozwól wszystkim @wzmiankować tę rolę** albo daj botowi uprawnienie **Wzmiankowanie @everyone, @here i wszystkich ról**.
 
-1. Kliknij ikonę koła zębatego przy kanale (**Edytuj kanał**).
-2. W zakładce **Przegląd** włącz **Kanał z ograniczeniem wiekowym**, jeśli treści są dla dorosłych.
-3. W zakładce **Integracje → Webhooki** kliknij **Nowy webhook**, nadaj mu nazwę i kliknij **Kopiuj adres URL webhooka**.
+### 3. Utwórz kanał konfiguracyjny `#bot-config`
 
-Jeden webhook to jeden kanał. Każdy subreddit i każda nisza RedGifs potrzebuje własnego webhooka.
-
-Adres webhooka działa jak hasło: kto go ma, może pisać na ten kanał. Nie wklejaj go do kodu ani do plików w repozytorium, tylko do sekretów w kroku 4.
-
-### 3. Przygotuj listę kanałów
-
-Jedna linijka na kanał: najpierw źródło, potem spacja i adres webhooka Discorda.
+Utwórz na serwerze kanał tekstowy o nazwie `bot-config`. Każda wiadomość na nim to lista źródeł, jedna linijka na źródło: najpierw źródło, potem kanał, na który mają trafiać posty.
 
 ```text
-r/NazwaSubreddita https://discord.com/api/webhooks/...
-r/InnySubreddit https://discord.com/api/webhooks/...
+r/NazwaSubreddita #kanał-z-postami
+redgifs/nazwa-niszy #inny-kanał
 ```
 
-- `r/nazwa` – subreddit. Zamiast tego możesz wkleić pełny adres, np. `https://www.reddit.com/r/nazwa`.
+- `r/nazwa` – subreddit. Możesz też wkleić pełny adres, np. `https://www.reddit.com/r/nazwa`.
 - `redgifs/nazwa` – nisza RedGifs, nazwa z adresu `https://www.redgifs.com/niches/<nazwa>`. Też możesz wkleić cały adres niszy.
-- Puste linijki i linijki zaczynające się od `#` są pomijane.
+- Kanał wskaż, wpisując `#` i wybierając go z podpowiedzi Discorda. Działa też sama nazwa albo ID kanału.
 
-Jeśli któraś linijka jest błędna, bot pominie tylko ją i wypisze w logu przebiegu, co jest nie tak. Pozostałe kanały działają dalej.
+Przy następnym uruchomieniu bot doda pod wiadomością ✅, jeśli wszystko jest poprawne. Jeśli któraś linijka jest błędna, doda ❌ i odpowie, co pominął; poprawne linijki z tej wiadomości i tak działają. Po edycji wiadomości reakcja się zaktualizuje.
 
-### 4. Dodaj sekret w repozytorium
+Żeby usunąć źródło, usuń wiadomość (albo linijkę w niej). Kto może dodawać źródła, ustalasz uprawnieniem **Wysyłanie wiadomości** na kanale `#bot-config`. Najlepiej, żeby nie było tam innej rozmowy, bo bot odpowie ❌ na każdą wiadomość, której nie zrozumie.
 
-Wejdź w **Settings → Secrets and variables → Actions → New repository secret**, nazwij sekret `CHANNELS` i wklej listę kanałów z kroku 3. To jedyny sekret, którego bot potrzebuje.
+Jeśli kanał ma mieć inną nazwę, dodaj w **Settings → Secrets and variables → Actions → Variables** zmienną `CONFIG_CHANNEL` z tą nazwą albo ID kanału.
+
+### 4. Dodaj token bota do sekretów
+
+Wejdź w **Settings → Secrets and variables → Actions → New repository secret**, nazwij sekret `DISCORD_TOKEN` i wklej token z kroku 2. To jedyny sekret, którego bot potrzebuje. Nowe źródła dodaje się już tylko na Discordzie.
 
 Konto Reddita nie jest potrzebne. Reddit blokuje adresy IP GitHub Actions, więc bot pobiera posty z publicznego archiwum Arctic Shift, które działa bez logowania.
-
-Starsze sekrety `DISCORD_CHANNELS` i `REDGIFS_CHANNELS` (JSON) nadal działają. Kanały z nich są dołączane do listy z `CHANNELS`.
 
 ### 5. Uruchom bota ręcznie (test)
 
@@ -57,7 +59,7 @@ Starsze sekrety `DISCORD_CHANNELS` i `REDGIFS_CHANNELS` (JSON) nadal działają.
 2. Po kilkudziesięciu sekundach przebieg powinien mieć zielony znaczek, a na pierwszym kanale powinny pojawić się posty.
 3. W repozytorium powinien pojawić się commit **Update feed state** ze zmienionymi plikami `posted.json` i `rotation.json`.
 
-Jeśli na kanale nic się nie pojawiło, kliknij przebieg i rozwiń krok **Run script**. Bot wypisuje tam, który kanał obsłużył i które linijki sekretu `CHANNELS` pominął. Jeśli przebieg ma czerwony X, rozwiń krok oznaczony X.
+Jeśli na kanale nic się nie pojawiło, kliknij przebieg i rozwiń krok **Run script**. Bot wypisuje tam, ile źródeł znalazł na `#bot-config`, które obsłużył i dlaczego coś się nie udało (np. brak uprawnień albo wyłączony Message Content Intent). Jeśli przebieg ma czerwony X, rozwiń krok oznaczony X.
 
 ### 6. Ustaw automatyczne uruchamianie
 
@@ -91,7 +93,7 @@ Jeśli używasz cron-job.org, usuń z `.github/workflows/run.yml` sekcję `sched
 
 ## Rotacja kanałów
 
-Kanały są obsługiwane po kolei, jeden na uruchomienie, w kolejności linijek z `CHANNELS` (kanały ze starszych sekretów JSON trafiają na koniec). Przy czterech kanałach i uruchamianiu co 30 minut każdy kanał dostaje nowe treści co 2 godziny.
+Źródła są obsługiwane po kolei, jedno na uruchomienie, w kolejności wiadomości na `#bot-config` (od najstarszej) i linijek w nich. Przy czterech kanałach i uruchamianiu co 30 minut każdy kanał dostaje nowe treści co 2 godziny.
 
 Ustawienia w `bot.py`:
 - `TOP_DAY_LIMIT` – ile najlepszych postów z czołówki sprawdzać w jednym przebiegu (domyślnie 5).

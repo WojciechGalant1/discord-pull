@@ -26,9 +26,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run script
         env:
-          CHANNELS: ${{ secrets.CHANNELS }}
-          DISCORD_CHANNELS: ${{ secrets.DISCORD_CHANNELS }}
-          REDGIFS_CHANNELS: ${{ secrets.REDGIFS_CHANNELS }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CONFIG_CHANNEL: ${{ vars.CONFIG_CHANNEL }}
         run: python bot.py
       - name: Save posted history
         run: |
