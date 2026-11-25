@@ -29,6 +29,7 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           CONFIG_CHANNEL: ${{ vars.CONFIG_CHANNEL }}
+          RUN_INTERVAL_MINUTES: ${{ vars.RUN_INTERVAL_MINUTES }}
         run: python bot.py
       - name: Save posted history
         if: ${{ !cancelled() }}
@@ -37,6 +38,7 @@ jobs:
           git config --local user.name "GitHub Action"
           cp posted.json /tmp/posted.json
           cp rotation.json /tmp/rotation.json
+          cp schedule.json /tmp/schedule.json 2>/dev/null || true
           for attempt in 1 2 3 4 5; do
             git fetch origin main
             git reset --hard origin/main
@@ -53,6 +55,10 @@ jobs:
               json.dump(merged, f)
           EOF
             cp /tmp/rotation.json rotation.json
+            if [ -f /tmp/schedule.json ]; then
+              cp /tmp/schedule.json schedule.json
+              git add schedule.json
+            fi
             git add posted.json rotation.json
             if git diff --cached --quiet; then
               exit 0

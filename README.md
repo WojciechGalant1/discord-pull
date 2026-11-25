@@ -91,6 +91,23 @@ Przy prywatnym repozytorium licz się z limitem 2000 minut: uruchamianie co 10 m
 
 Jeśli używasz cron-job.org, usuń z `.github/workflows/run.yml` sekcję `schedule` (dwie linijki: `schedule:` i `- cron: ...`), zostawiając `workflow_dispatch:`. Inaczej bot będzie uruchamiany przez oba harmonogramy naraz i zużyje dwa razy więcej minut.
 
+## Komenda /when (opcjonalnie)
+
+`/when` pokazuje, za ile mniej więcej pojawią się nowe treści na kanale, na którym ją wpiszesz (albo na kanale wybranym w opcji `kanal`). Na kanale bez źródeł pokazuje wszystkie. Odpowiedź widzi tylko osoba, która wpisała komendę, a czas odlicza się na żywo.
+
+Bot działa tylko w czasie przebiegów GitHub Actions, więc na komendy odpowiada darmowy Cloudflare Worker, który czyta plik `schedule.json` zapisywany przez bota po każdym przebiegu.
+
+1. **Token GitHuba dla Workera:** utwórz fine-grained token jak w kroku 6, ale w **Repository permissions** ustaw **Contents** na **Read-only**.
+2. **Worker:** zaloguj się na [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages → Create → Create Worker** (szablon Hello World) → **Deploy** → **Edit code**. Wklej całą zawartość `worker/worker.js` i kliknij **Deploy**. Skopiuj adres Workera (`https://....workers.dev`).
+3. **Zmienne Workera:** w **Settings → Variables and Secrets** dodaj:
+   - `DISCORD_PUBLIC_KEY` (Text) – **Public Key** z zakładki **General Information** w Discord Developer Portal,
+   - `GITHUB_REPO` (Text) – `TWOJ_LOGIN/NAZWA_REPO`,
+   - `GITHUB_TOKEN` (Secret) – token z punktu 1.
+4. **Adres dla Discorda:** w Discord Developer Portal → **General Information** wklej adres Workera w **Interactions Endpoint URL** i zapisz. Discord od razu sprawdza Workera; jeśli zapis się nie uda, sprawdź `DISCORD_PUBLIC_KEY`.
+5. **Rejestracja komendy:** na GitHubie w **Actions** wybierz **Register command → Run workflow**. Po chwili `/when` pojawi się na serwerze (czasem trzeba przeładować Discorda: Ctrl+R).
+
+Czasy są liczone z założenia, że bot uruchamia się co 10 minut. Jeśli używasz innej częstotliwości, dodaj w **Settings → Secrets and variables → Actions → Variables** zmienną `RUN_INTERVAL_MINUTES`, np. `30`.
+
 ## Rotacja kanałów
 
 Źródła są obsługiwane po kolei, po 5 na uruchomienie, w kolejności wiadomości na `#bot-config` (od najstarszej) i linijek w nich. Przy 15 źródłach i uruchamianiu co 30 minut każde źródło dostaje nowe treści co 1,5 godziny.

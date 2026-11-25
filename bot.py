@@ -11,6 +11,7 @@ import requests
 
 STATE_FILE = "posted.json"
 ROTATION_FILE = "rotation.json"
+SCHEDULE_FILE = "schedule.json"
 MAX_HISTORY = 3000
 SOURCES_PER_RUN = 5  # Ile kolejnych źródeł z kolejki obsłużyć w jednym przebiegu
 TOP_DAY_LIMIT = 5  # Ile najlepszych postów z TOP dnia (top/?t=day) sprawdzać w każdym przebiegu
@@ -38,6 +39,8 @@ DISCORD_HEADERS = {
 CONFIG_CHANNEL = os.environ.get("CONFIG_CHANNEL", "").strip().lstrip("#") or "bot-config"
 POSTABLE_CHANNEL_TYPES = (0, 5)  # Kanał tekstowy i kanał ogłoszeń
 OK_EMOJI, ERROR_EMOJI = "✅", "❌"
+# Co ile minut uruchamia się bot (harmonogram w run.yml albo cron-job.org); służy tylko do szacowania czasów w /when
+RUN_INTERVAL_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES") or 10)
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
 
@@ -192,6 +195,24 @@ def load_channels() -> list:
                 if channel not in channels:
                     channels.append(channel)
     return channels
+
+
+def save_schedule(channels: list, next_index: int):
+    """Plik, z którego komenda /when (Cloudflare Worker) wylicza czas następnej wysyłki każdego źródła."""
+    schedule = {
+        "last_run": int(time.time()),
+        "interval_minutes": RUN_INTERVAL_MINUTES,
+        "sources": [
+            {
+                "source": f"redgifs/{name}" if source == "redgifs" else f"r/{name}",
+                "channel_id": channel_id,
+                "runs_ahead": ((i - next_index) % len(channels)) // SOURCES_PER_RUN,
+            }
+            for i, (source, name, channel_id) in enumerate(channels)
+        ],
+    }
+    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+        json.dump(schedule, f)
 
 
 _REDGIFS_TOKEN = None
@@ -716,6 +737,8 @@ def main():
         index = (index + 1) % len(channels)
         save_posted_history(posted_history)
         save_rotation_index(index)
+
+    save_schedule(channels, index)
 
 
 if __name__ == "__main__":
