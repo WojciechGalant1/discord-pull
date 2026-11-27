@@ -132,6 +132,12 @@
       "name": "bnwo-whiteboys",
       "channel_id": "1575920867790168084",
       "channel_name": "bnwo-whiteboys-a"
+    },
+    {
+      "type": "reddit",
+      "name": "QOS_Tats",
+      "channel_id": "1575921340517720124",
+      "channel_name": "qos_tats"
     }
   ]
 }
