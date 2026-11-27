@@ -21,6 +21,7 @@ ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/posts/search"
 REDGIFS_TOP_MAX_PAGE = 10  # Z ilu pierwszych stron (po 40 filmów) najpopularniejszych losować fallback
 USER_HISTORY_PAGES = 5  # Ile stron (po 100 postów) historii użytkownika Reddita przeszukać w fallbacku
 MAX_FILES_PER_MESSAGE = 10  # Limit załączników w jednej wiadomości Discorda
+SUPPRESS_EMBEDS = 1 << 2  # Flaga wiadomości Discorda: bez podglądów linków (załączniki zostają)
 MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -410,12 +411,15 @@ def message_header(title: str) -> str:
     return " ".join(parts)
 
 
-def post_to_discord(channel_id: str, content: str, files: list[tuple] | None = None) -> bool:
+def post_to_discord(channel_id: str, content: str, files: list[tuple] | None = None, embeds: bool = True) -> bool:
     # Tytuły postów pochodzą od obcych osób, więc pingować wolno wyłącznie skonfigurowaną rolę (bez @everyone itp.)
     payload = {
         "content": content,
         "allowed_mentions": {"parse": [], "roles": [ROLE_ID] if ROLE_ID else []},
     }
+    if not embeds:
+        # Linki w opisach (np. reklamy twórców na RedGifs) dokładałyby podgląd jako drugi obrazek lub film
+        payload["flags"] = SUPPRESS_EMBEDS
     path = f"/channels/{channel_id}/messages"
     if files:
         r = discord_api(
@@ -449,7 +453,7 @@ def media_file(url: str, data: bytes, fallback_name: str) -> tuple:
 
 def post_with_links(channel_id: str, header: str, links: list[str]) -> bool:
     # Discord ukrywa adres tylko wtedy, gdy wiadomość zawiera sam link, więc tytuł idzie osobno
-    ok = post_to_discord(channel_id, header) if header else False
+    ok = post_to_discord(channel_id, header, embeds=False) if header else False
     for link in links:
         ok = post_to_discord(channel_id, link) or ok
     return ok
@@ -480,7 +484,7 @@ def send_media(channel_id: str, header: str, urls: list[str], name_prefix: str) 
 
     ok = False
     for idx, batch in enumerate(batches):
-        ok = post_to_discord(channel_id, header if idx == 0 else "", files=batch) or ok
+        ok = post_to_discord(channel_id, header if idx == 0 else "", files=batch, embeds=False) or ok
         time.sleep(1)
     return post_with_links(channel_id, "", links) or ok
 
@@ -488,7 +492,7 @@ def send_media(channel_id: str, header: str, urls: list[str], name_prefix: str) 
 def send_redgifs(channel_id: str, gif_id: str, header: str, urls: dict | None = None) -> bool:
     video_bytes = resolve_redgifs_mp4(gif_id, urls)
     if video_bytes:
-        return post_to_discord(channel_id, header, files=[(f"{gif_id}.mp4", video_bytes, "video/mp4")])
+        return post_to_discord(channel_id, header, files=[(f"{gif_id}.mp4", video_bytes, "video/mp4")], embeds=False)
     return post_with_links(channel_id, header, [f"https://www.redgifs.com/watch/{gif_id}"])
 
 
